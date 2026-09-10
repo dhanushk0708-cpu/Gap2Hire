@@ -9,6 +9,10 @@ Requires-Dist: sqlalchemy
 Requires-Dist: asyncpg
 Requires-Dist: alembic
 Requires-Dist: pydantic-settings
+Requires-Dist: pwdlib[argon2]
+Requires-Dist: PyJWT
+Requires-Dist: pydantic-settings
+Requires-Dist: pydantic[email]
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

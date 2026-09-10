@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: str = "development"
     database_url: str
+    jwt_secret_key: str
 
     model_config = SettingsConfigDict(
         env_file=".env",
