@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 
+from app.api.applications import router as applications_router
 from app.api.auth import router as auth_router
+from app.api.candidates import router as candidates_router
 from app.api.capabilities import router as capabilities_router
 from app.api.jd_analysis import router as jd_analysis_router
 from app.api.jobs import router as jobs_router
@@ -17,6 +19,8 @@ app.include_router(auth_router)
 app.include_router(jobs_router)
 app.include_router(capabilities_router)
 app.include_router(jd_analysis_router)
+app.include_router(candidates_router)
+app.include_router(applications_router)
 
 
 @app.get("/health")
