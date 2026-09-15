@@ -8,11 +8,13 @@ from app.core.roles import UserRole
 from app.db.session import get_db_session
 from app.models.user import User
 from app.schemas.capability import (
+    CapabilityBatchCreate,
     CapabilityCreate,
     CapabilityResponse,
     CapabilityUpdate,
 )
 from app.services.capability import (
+    create_capabilities_batch,
     create_capability,
     delete_capability,
     list_capabilities,
@@ -54,6 +56,31 @@ async def add_capability_to_job(
             detail="Job not found",
         )
     return capability
+
+
+@router.post(
+    "/jobs/{job_id}/capabilities/batch",
+    response_model=list[CapabilityResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_capabilities_batch_to_job(
+    job_id: UUID,
+    data: CapabilityBatchCreate,
+    current_user: User = Depends(require_capability_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    capabilities = await create_capabilities_batch(
+        session=session,
+        job_id=job_id,
+        organization_id=current_user.organization_id,
+        capabilities_data=data.capabilities,
+    )
+    if capabilities is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found",
+        )
+    return capabilities
 
 
 @router.get(

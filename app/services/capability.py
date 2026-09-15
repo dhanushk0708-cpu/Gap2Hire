@@ -51,6 +51,38 @@ async def create_capability(
 
     return capability
 
+async def create_capabilities_batch(
+    session: AsyncSession,
+    job_id: UUID,
+    organization_id: UUID,
+    capabilities_data: list[CapabilityCreate],
+) -> list[Capability] | None:
+    job = await get_job_for_organization(session, job_id, organization_id)
+    if job is None:
+        return None
+
+    created_capabilities: list[Capability] = []
+    for data in capabilities_data:
+        importance_value = (
+            data.importance.value
+            if isinstance(data.importance, CapabilityImportance)
+            else str(data.importance)
+        )
+        capability = Capability(
+            job_id=job_id,
+            name=data.name,
+            description=data.description,
+            importance=importance_value,
+        )
+        session.add(capability)
+        created_capabilities.append(capability)
+
+    await session.commit()
+    for cap in created_capabilities:
+        await session.refresh(cap)
+
+    return created_capabilities
+
 
 async def list_capabilities(
     session: AsyncSession,

@@ -18,6 +18,10 @@ class CapabilityCreate(BaseModel):
     importance: CapabilityImportance = CapabilityImportance.MEDIUM
 
 
+class CapabilityBatchCreate(BaseModel):
+    capabilities: list[CapabilityCreate] = Field(min_length=1)
+
+
 class CapabilityUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
