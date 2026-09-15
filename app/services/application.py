@@ -10,6 +10,7 @@ from app.models.application import Application
 from app.models.candidate import Candidate
 from app.models.job import Job
 from app.schemas.application import ApplicationCreate, ApplicationStatus, ApplicationUpdate
+from app.services.resume_processor import extract_text_from_pdf_bytes
 from app.services.storage import BaseStorageService, default_storage_service
 
 
@@ -38,6 +39,14 @@ class FileEmptyError(Exception):
 
 
 class FileTooLargeError(Exception):
+    pass
+
+
+class NoResumeUploadedError(Exception):
+    pass
+
+
+class ResumeFileNotFoundError(Exception):
     pass
 
 
@@ -176,6 +185,35 @@ async def save_application_resume(
     storage_key = await storage_service.save_file(file_bytes, destination_key)
 
     application.resume_path = storage_key
+    await session.commit()
+    await session.refresh(application)
+    return application
+
+
+async def process_application_resume(
+    session: AsyncSession,
+    application_id: UUID,
+    organization_id: UUID,
+    storage_service: BaseStorageService | None = None,
+) -> Application:
+    application = await get_application_by_id(session, application_id, organization_id)
+    if application is None:
+        raise ApplicationNotFoundError("Application not found")
+
+    if not application.resume_path:
+        raise NoResumeUploadedError("No resume has been uploaded for this application")
+
+    if storage_service is None:
+        storage_service = default_storage_service
+
+    try:
+        pdf_bytes = await storage_service.read_file(application.resume_path)
+    except FileNotFoundError as exc:
+        raise ResumeFileNotFoundError("Stored resume file not found") from exc
+
+    extracted_text = extract_text_from_pdf_bytes(pdf_bytes)
+
+    application.resume_text = extracted_text
     await session.commit()
     await session.refresh(application)
     return application

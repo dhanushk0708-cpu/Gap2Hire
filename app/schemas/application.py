@@ -33,6 +33,7 @@ class ApplicationResponse(BaseModel):
     job_id: UUID
     status: str
     resume_path: str | None
+    resume_text: str | None = None
     applied_at: datetime
     created_at: datetime
     updated_at: datetime

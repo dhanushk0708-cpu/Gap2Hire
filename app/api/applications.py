@@ -20,12 +20,16 @@ from app.services.application import (
     FileTooLargeError,
     InvalidFileTypeError,
     JobNotFoundError,
+    NoResumeUploadedError,
+    ResumeFileNotFoundError,
     create_application,
     get_application_by_id,
     list_applications,
+    process_application_resume,
     save_application_resume,
     update_application,
 )
+from app.services.resume_processor import NoExtractableTextError
 
 router = APIRouter(
     prefix="/api/v1/applications",
@@ -165,5 +169,33 @@ async def upload_application_resume(
     except FileTooLargeError as e:
         raise HTTPException(
             status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/resume/process",
+    response_model=ApplicationResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def process_resume_text(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await process_application_resume(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except (ApplicationNotFoundError, ResumeFileNotFoundError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except (NoResumeUploadedError, NoExtractableTextError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e

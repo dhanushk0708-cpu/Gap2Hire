@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -43,6 +43,11 @@ class Application(Base):
 
     resume_path: Mapped[str | None] = mapped_column(
         String(512),
+        nullable=True,
+    )
+
+    resume_text: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
     )
 

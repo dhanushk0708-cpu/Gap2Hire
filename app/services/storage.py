@@ -11,6 +11,11 @@ class BaseStorageService(ABC):
         pass
 
     @abstractmethod
+    async def read_file(self, destination_key: str) -> bytes:
+        """Reads and returns file bytes for a relative destination key."""
+        pass
+
+    @abstractmethod
     async def delete_file(self, destination_key: str) -> bool:
         """Deletes a file given its storage reference key."""
         pass
@@ -30,6 +35,12 @@ class LocalStorageService(BaseStorageService):
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(file_bytes)
         return destination_key.replace("\\", "/")
+
+    async def read_file(self, destination_key: str) -> bytes:
+        target_path = (self.base_dir / destination_key).resolve()
+        if not str(target_path).startswith(str(self.base_dir)) or not target_path.exists():
+            raise FileNotFoundError("Storage file not found")
+        return target_path.read_bytes()
 
     async def delete_file(self, destination_key: str) -> bool:
         target_path = (self.base_dir / destination_key).resolve()
