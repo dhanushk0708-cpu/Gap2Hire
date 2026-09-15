@@ -1,14 +1,16 @@
 from collections.abc import Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.application import Application
 from app.models.candidate import Candidate
 from app.models.job import Job
 from app.schemas.application import ApplicationCreate, ApplicationStatus, ApplicationUpdate
+from app.services.storage import BaseStorageService, default_storage_service
 
 
 class CandidateNotFoundError(Exception):
@@ -19,7 +21,23 @@ class JobNotFoundError(Exception):
     pass
 
 
+class ApplicationNotFoundError(Exception):
+    pass
+
+
 class DuplicateApplicationError(Exception):
+    pass
+
+
+class InvalidFileTypeError(Exception):
+    pass
+
+
+class FileEmptyError(Exception):
+    pass
+
+
+class FileTooLargeError(Exception):
     pass
 
 
@@ -118,6 +136,46 @@ async def update_application(
             value = value.value
         setattr(application, field, value)
 
+    await session.commit()
+    await session.refresh(application)
+    return application
+
+
+async def save_application_resume(
+    session: AsyncSession,
+    application_id: UUID,
+    organization_id: UUID,
+    file_bytes: bytes,
+    original_filename: str | None = None,
+    storage_service: BaseStorageService | None = None,
+) -> Application:
+    application = await get_application_by_id(session, application_id, organization_id)
+    if application is None:
+        raise ApplicationNotFoundError("Application not found")
+
+    if not file_bytes or len(file_bytes) == 0:
+        raise FileEmptyError("Resume file is empty")
+
+    if len(file_bytes) > settings.max_resume_size_bytes:
+        raise FileTooLargeError(
+            f"Resume file size exceeds maximum limit of {settings.max_resume_size_bytes} bytes"
+        )
+
+    if original_filename:
+        ext = original_filename.lower().rsplit(".", 1)[-1] if "." in original_filename else ""
+        if ext != "pdf":
+            raise InvalidFileTypeError("Only PDF resumes are supported")
+
+    if not file_bytes.startswith(b"%PDF-"):
+        raise InvalidFileTypeError("Invalid PDF file header")
+
+    if storage_service is None:
+        storage_service = default_storage_service
+
+    destination_key = f"resumes/{application_id}_{uuid4().hex}.pdf"
+    storage_key = await storage_service.save_file(file_bytes, destination_key)
+
+    application.resume_path = storage_key
     await session.commit()
     await session.refresh(application)
     return application

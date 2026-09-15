@@ -8,7 +8,9 @@ class Settings(BaseSettings):
     database_url: str
     jwt_secret_key: str
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
+    storage_dir: str = "uploads"
+    max_resume_size_bytes: int = 10 * 1024 * 1024  # 10 MB
 
     model_config = SettingsConfigDict(
         env_file=".env",

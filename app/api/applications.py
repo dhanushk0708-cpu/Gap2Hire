@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.authorization import require_roles
@@ -13,12 +13,17 @@ from app.schemas.application import (
     ApplicationUpdate,
 )
 from app.services.application import (
+    ApplicationNotFoundError,
     CandidateNotFoundError,
     DuplicateApplicationError,
+    FileEmptyError,
+    FileTooLargeError,
+    InvalidFileTypeError,
     JobNotFoundError,
     create_application,
     get_application_by_id,
     list_applications,
+    save_application_resume,
     update_application,
 )
 
@@ -125,3 +130,40 @@ async def update_existing_application(
             detail="Application not found",
         )
     return application
+
+
+@router.post(
+    "/{application_id}/resume",
+    response_model=ApplicationResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def upload_application_resume(
+    application_id: UUID,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    contents = await file.read()
+    try:
+        return await save_application_resume(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            file_bytes=contents,
+            original_filename=file.filename,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except (InvalidFileTypeError, FileEmptyError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except FileTooLargeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail=str(e),
+        ) from e
