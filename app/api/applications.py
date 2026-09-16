@@ -12,6 +12,8 @@ from app.schemas.application import (
     ApplicationResponse,
     ApplicationUpdate,
 )
+from app.schemas.evidence import ApplicationEvidenceSummary, EvidenceResponse
+from app.services.ai_evidence import AIEvidenceServiceError
 from app.services.application import (
     ApplicationNotFoundError,
     CandidateNotFoundError,
@@ -28,6 +30,12 @@ from app.services.application import (
     process_application_resume,
     save_application_resume,
     update_application,
+)
+from app.services.evidence import (
+    NoApprovedCapabilitiesError,
+    NoProcessedResumeError,
+    analyze_application_evidence,
+    get_application_evidence_summary,
 )
 from app.services.resume_processor import NoExtractableTextError
 
@@ -197,5 +205,61 @@ async def process_resume_text(
     except (NoResumeUploadedError, NoExtractableTextError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/evidence/analyze",
+    response_model=list[EvidenceResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def analyze_evidence_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await analyze_application_evidence(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except (NoProcessedResumeError, NoApprovedCapabilitiesError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except AIEvidenceServiceError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/evidence/summary",
+    response_model=ApplicationEvidenceSummary,
+    status_code=status.HTTP_200_OK,
+)
+async def get_evidence_summary_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await get_application_evidence_summary(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
