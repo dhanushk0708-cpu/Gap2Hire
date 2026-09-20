@@ -56,6 +56,12 @@ class Evidence(Base):
         nullable=False,
     )
 
+    provenance: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="CLAIM",
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=datetime.utcnow,

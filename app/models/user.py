@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.models.organization import Organization
-
+from app.core.roles import UserRole
 
 class User(Base):
     __tablename__ = "users"
@@ -42,10 +42,9 @@ class User(Base):
         String(255),
         nullable=False,
     )
-
     role: Mapped[str] = mapped_column(
-        String(50),
-        nullable=False,
+    String(50),
+    nullable=False,
     )
 
     is_active: Mapped[bool] = mapped_column(

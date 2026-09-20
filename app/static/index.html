@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gap2Hire — Evidence-Driven Hiring Platform</title>
+  <meta name="description" content="Gap2Hire: Find the Gap. Build the Skill. Get Hired. Full end-to-end evidence-based hiring demo.">
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Navbar -->
+    <header class="navbar" id="navbar" style="display: none;">
+      <a href="#dashboard" class="nav-brand" style="text-decoration: none;">
+        <div class="brand-logo">G2H</div>
+        <div class="brand-text">
+          Gap2Hire
+          <span class="brand-badge">HR Hub</span>
+        </div>
+      </a>
+
+      <nav class="nav-links">
+        <a href="#dashboard" class="nav-link" id="nav-dashboard">
+          <span>📊</span> Dashboard
+        </a>
+        <a href="#jobs" class="nav-link" id="nav-jobs">
+          <span>💼</span> Jobs & Blueprints
+        </a>
+        <a href="#candidates" class="nav-link" id="nav-candidates">
+          <span>👥</span> Screening Queue
+        </a>
+      </nav>
+
+      <div class="nav-user">
+        <div class="user-badge" id="user-badge">
+          <div class="user-avatar" id="user-avatar">HR</div>
+          <div>
+            <div class="user-name" id="user-display-name">Admin</div>
+            <div class="user-org" id="user-display-org">Acme Corp</div>
+          </div>
+        </div>
+        <button class="btn btn-outline btn-sm" id="btn-logout">Logout</button>
+      </div>
+    </header>
+
+    <!-- Main Dynamic Content -->
+    <main class="main-container" id="main-view">
+      <!-- Views injected here dynamically by router -->
+    </main>
+  </div>
+
+  <!-- Modal Container -->
+  <div id="modal-container"></div>
+
+  <!-- Toast Container -->
+  <div id="toast-container"></div>
+
+  <!-- JavaScript Modules -->
+  <script src="/js/api.js"></script>
+  <script src="/js/state.js"></script>
+  <script src="/js/views/auth.js"></script>
+  <script src="/js/views/dashboard.js"></script>
+  <script src="/js/views/jobs.js"></script>
+  <script src="/js/views/candidates.js"></script>
+  <script src="/js/views/candidate_detail.js"></script>
+  <script src="/js/views/interview_setup.js"></script>
+  <script src="/js/views/interview_live.js"></script>
+  <script src="/js/views/interview_report.js"></script>
+  <script src="/js/router.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

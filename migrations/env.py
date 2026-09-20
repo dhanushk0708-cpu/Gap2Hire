@@ -23,6 +23,14 @@ config.set_main_option(
 target_metadata = Base.metadata
 
 
+def include_object(object, name, type_, reflected, compare_to):
+    if type_ == "table" and (name.startswith("checkpoint") or name in {"checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"}):
+        return False
+    if type_ == "index" and (name.startswith("checkpoint") or (object.table is not None and object.table.name.startswith("checkpoint"))):
+        return False
+    return True
+
+
 def run_migrations_offline() -> None:
     """Run migrations in offline mode."""
 
@@ -33,6 +41,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -45,6 +54,7 @@ def do_run_migrations(connection) -> None:
     context.configure(
         connection=connection,
         target_metadata=target_metadata,
+        include_object=include_object,
     )
 
     with context.begin_transaction():

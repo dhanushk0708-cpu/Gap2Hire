@@ -41,6 +41,33 @@ class Application(Base):
         default="APPLIED",
     )
 
+    screening_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="PENDING",
+    )
+
+    screening_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    shortlist_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="PENDING",
+    )
+
+    shortlist_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    shortlisted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     resume_path: Mapped[str | None] = mapped_column(
         String(512),
         nullable=True,

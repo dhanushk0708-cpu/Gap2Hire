@@ -13,6 +13,7 @@ from app.schemas.evidence import (
     ApplicationEvidenceSummary,
     CapabilityEvidenceState,
     CapabilityEvidenceSummary,
+    EvidenceProvenance,
     EvidenceStrength,
 )
 from app.services.ai_evidence import extract_evidence_from_resume
@@ -90,6 +91,7 @@ async def analyze_application_evidence(
 
         if existing_ev is not None:
             existing_ev.strength = strength_str
+            existing_ev.provenance = "CLAIM"
             existing_ev.content = content_val
             existing_ev.updated_at = datetime.utcnow()
         else:
@@ -98,6 +100,7 @@ async def analyze_application_evidence(
                 capability_id=target_cap.id,
                 source_type="RESUME",
                 strength=strength_str,
+                provenance="CLAIM",
                 content=content_val,
             )
             session.add(new_ev)
@@ -154,10 +157,13 @@ async def get_application_evidence_summary(
         if ev is not None:
             state = CapabilityEvidenceState.KNOWN
             strength = EvidenceStrength(ev.strength)
+            prov_str = getattr(ev, "provenance", "CLAIM") or "CLAIM"
+            provenance = EvidenceProvenance(prov_str)
             content = ev.content
         else:
             state = CapabilityEvidenceState.UNKNOWN
             strength = EvidenceStrength.INSUFFICIENT
+            provenance = EvidenceProvenance.CLAIM
             content = None
 
         cap_summaries.append(
@@ -166,6 +172,7 @@ async def get_application_evidence_summary(
                 name=cap.name,
                 state=state,
                 strength=strength,
+                provenance=provenance,
                 evidence=content,
             )
         )

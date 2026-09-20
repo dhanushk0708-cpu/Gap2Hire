@@ -5,7 +5,7 @@ from app.core.security import hash_password, verify_password
 from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.auth import RegisterRequest
-
+from app.core.roles import UserRole
 
 async def register_user(
     session: AsyncSession,
@@ -27,9 +27,8 @@ async def register_user(
         email=data.email,
         password_hash=hash_password(data.password),
         full_name=data.full_name,
-        role="COMPANY_ADMIN",
+        role=UserRole.COMPANY_ADMIN.value,
     )
-
     organization.users.append(user)
 
     session.add(organization)

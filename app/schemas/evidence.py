@@ -12,6 +12,14 @@ class EvidenceStrength(str, Enum):
     INSUFFICIENT = "INSUFFICIENT"
 
 
+class EvidenceProvenance(str, Enum):
+    CLAIM = "CLAIM"
+    CORROBORATED = "CORROBORATED"
+    VERIFIED = "VERIFIED"
+    DEMONSTRATED = "DEMONSTRATED"
+    PERFORMANCE = "PERFORMANCE"
+
+
 class CapabilityEvidenceState(str, Enum):
     KNOWN = "KNOWN"
     UNKNOWN = "UNKNOWN"
@@ -34,6 +42,7 @@ class EvidenceResponse(BaseModel):
     source_type: str
     content: str | None
     strength: str
+    provenance: EvidenceProvenance = EvidenceProvenance.CLAIM
     created_at: datetime
     updated_at: datetime
 
@@ -45,6 +54,7 @@ class CapabilityEvidenceSummary(BaseModel):
     name: str
     state: CapabilityEvidenceState
     strength: EvidenceStrength
+    provenance: EvidenceProvenance = EvidenceProvenance.CLAIM
     evidence: str | None = Field(default=None)
 
     model_config = ConfigDict(from_attributes=True)

@@ -16,8 +16,9 @@ dependencies = [
 "pydantic-settings",
 "pwdlib[argon2]",
 "PyJWT",
-"pydantic-settings",
 "pydantic[email]",
+"langgraph",
+"langgraph-checkpoint-postgres",
 ]
 
 [project.optional-dependencies]

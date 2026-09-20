@@ -13,7 +13,12 @@ from app.schemas.application import (
     ApplicationUpdate,
 )
 from app.schemas.evidence import ApplicationEvidenceSummary, EvidenceResponse
+from app.schemas.hr_agent import HRAgentRequest, HRAgentResponse
+from app.schemas.interview_analysis import PreInterviewAnalysis
+from app.schemas.verification import VerificationCreate, VerificationResponse
 from app.services.ai_evidence import AIEvidenceServiceError
+from app.services.ai_hr_agent import HRAgentServiceError
+from app.services.interview_pre_analysis import build_pre_interview_analysis
 from app.services.application import (
     ApplicationNotFoundError,
     CandidateNotFoundError,
@@ -37,7 +42,13 @@ from app.services.evidence import (
     analyze_application_evidence,
     get_application_evidence_summary,
 )
+from app.services.hr_agent import process_hr_agent_request
 from app.services.resume_processor import NoExtractableTextError
+from app.services.verification import (
+    InvalidCapabilityError,
+    create_verification,
+    list_application_verifications,
+)
 
 router = APIRouter(
     prefix="/api/v1/applications",
@@ -263,3 +274,111 @@ async def get_evidence_summary_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
+
+
+@router.post(
+    "/{application_id}/evidence/assistant",
+    response_model=HRAgentResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def hr_evidence_assistant_endpoint(
+    application_id: UUID,
+    body: HRAgentRequest,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await process_hr_agent_request(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            message=body.message,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except HRAgentServiceError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/verifications",
+    response_model=VerificationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_verification_endpoint(
+    application_id: UUID,
+    body: VerificationCreate,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await create_verification(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            user_id=current_user.id,
+            data=body,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except InvalidCapabilityError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/verifications",
+    response_model=list[VerificationResponse],
+    status_code=status.HTTP_200_OK,
+)
+async def list_verifications_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await list_application_verifications(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/interview/pre-analysis",
+    response_model=PreInterviewAnalysis,
+    status_code=status.HTTP_200_OK,
+)
+async def get_pre_interview_analysis_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await build_pre_interview_analysis(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+

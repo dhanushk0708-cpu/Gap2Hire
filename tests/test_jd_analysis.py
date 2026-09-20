@@ -182,3 +182,39 @@ async def test_jd_analysis_ai_error_handled():
             )
             assert resp.status_code == 502
             assert "Groq API returned error status 500" in resp.json()["detail"]
+
+
+from unittest.mock import MagicMock
+
+
+@pytest.mark.asyncio
+async def test_extract_capabilities_uses_configured_model():
+    from app.core.config import settings
+    from app.services.ai_jd import extract_capabilities_from_jd
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "content": '{"capabilities": [{"name": "Python", "description": "Backend language", "importance": "HIGH"}]}'
+                }
+            }
+        ]
+    }
+
+    with patch("httpx.AsyncClient.post", return_value=mock_response) as mock_post, patch.object(
+        settings, "groq_api_key", "test_valid_groq_key"
+    ):
+        result = await extract_capabilities_from_jd(
+            title="Software Engineer",
+            description="Build APIs with Python",
+        )
+        assert len(result) == 1
+        assert result[0].name == "Python"
+
+        mock_post.assert_called_once()
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"]["model"] == settings.groq_model
+        assert kwargs["json"]["model"] == "openai/gpt-oss-120b"

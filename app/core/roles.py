@@ -1,0 +1,9 @@
+from enum import Enum
+
+
+class UserRole(str, Enum):
+    COMPANY_ADMIN = "COMPANY_ADMIN"
+    RECRUITER = "RECRUITER"
+    HIRING_MANAGER = "HIRING_MANAGER"
+    CANDIDATE = "CANDIDATE"
+    PLATFORM_ADMIN = "PLATFORM_ADMIN"
