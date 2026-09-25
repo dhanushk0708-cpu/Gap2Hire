@@ -805,6 +805,7 @@ async def run_job_screening_workflow(
                                     provenance="DEMONSTRATED",
                                     content=f"Concrete demonstration of {cap.name} verified in repository artifacts ({src.url}).",
                                     candidate_source_id=src.id,
+                                )
                 except Exception as deep_err:
                     logger.warning(f"Error inspecting repository source {src.url}: {deep_err}")
 
