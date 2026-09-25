@@ -17,12 +17,14 @@ class JobCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     description: str = Field(min_length=1)
     status: JobStatus = JobStatus.DRAFT
+    shortlist_size: int = Field(default=5, ge=1, le=1000)
 
 
 class JobUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, min_length=1)
     status: JobStatus | None = None
+    shortlist_size: int | None = Field(default=None, ge=1, le=1000)
 
 
 class JobResponse(BaseModel):
@@ -31,6 +33,7 @@ class JobResponse(BaseModel):
     title: str
     description: str
     status: str
+    shortlist_size: int
     created_by: UUID
     created_at: datetime
     updated_at: datetime

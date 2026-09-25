@@ -26,6 +26,7 @@ async def create_job(
         title=data.title,
         description=data.description,
         status=status_value,
+        shortlist_size=data.shortlist_size,
     )
 
     session.add(job)

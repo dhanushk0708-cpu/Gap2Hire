@@ -288,6 +288,18 @@ async def process_email_intake(
                 target_app.status = "SCREENING"
                 await session.flush()
 
+                # Sync candidate sources discovered in resume text
+                try:
+                    from app.services.resume_url_discovery import sync_resume_candidate_sources
+                    await sync_resume_candidate_sources(
+                        session=session,
+                        organization_id=organization_id,
+                        application_id=target_app.id,
+                        resume_text=resume_text,
+                    )
+                except Exception as src_err:
+                    logger.info(f"Candidate source discovery notice during intake: {src_err}")
+
                 # Extract resume evidence for capabilities
                 try:
                     await analyze_application_evidence(

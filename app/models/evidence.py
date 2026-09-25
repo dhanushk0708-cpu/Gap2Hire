@@ -10,6 +10,7 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.application import Application
     from app.models.capability import Capability
+    from app.models.candidate_source import CandidateSource
 
 
 class Evidence(Base):
@@ -37,6 +38,12 @@ class Evidence(Base):
     capability_id: Mapped[UUID] = mapped_column(
         ForeignKey("capabilities.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+
+    candidate_source_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("candidate_sources.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -77,3 +84,6 @@ class Evidence(Base):
 
     application: Mapped["Application"] = relationship()
     capability: Mapped["Capability"] = relationship()
+    candidate_source: Mapped["CandidateSource | None"] = relationship(
+        back_populates="evidence_items",
+    )

@@ -228,3 +228,5 @@ window.InterviewReportView = {
         if (btnReject) btnReject.addEventListener('click', () => handleDecision('NOT_SHORTLISTED', 'REJECTED', 'REJECT', 'badge-danger'));
     }
 };
+
+window.interviewReportView = window.InterviewReportView;

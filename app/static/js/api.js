@@ -31,6 +31,9 @@ const api = {
   async request(endpoint, options = {}) {
     const url = endpoint.startsWith("http") ? endpoint : `${this.baseUrl}${endpoint}`;
     const headers = { ...this.getHeaders(), ...(options.headers || {}) };
+    if (options.body instanceof FormData) {
+      delete headers["Content-Type"];
+    }
     
     try {
       const response = await fetch(url, {
@@ -75,6 +78,13 @@ const api = {
     });
   },
 
+  postForm(endpoint, formData) {
+    return this.request(endpoint, {
+      method: "POST",
+      body: formData,
+    });
+  },
+
   patch(endpoint, body) {
     return this.request(endpoint, {
       method: "PATCH",
@@ -112,8 +122,8 @@ const api = {
     get(jobId) {
       return api.get(`/jobs/${jobId}`);
     },
-    create(title, description) {
-      return api.post("/jobs", { title, description });
+    create(title, description, shortlistSize = 5) {
+      return api.post("/jobs", { title, description, shortlist_size: shortlistSize });
     },
     update(jobId, data) {
       return api.patch(`/jobs/${jobId}`, data);
@@ -162,14 +172,36 @@ const api = {
     getScreeningReport(applicationId) {
       return api.get(`/applications/${applicationId}/screening`);
     },
+    getScreeningProfile(applicationId) {
+      return api.get(`/applications/${applicationId}/screening-profile`);
+    },
     runScreening(applicationId) {
       return api.post(`/applications/${applicationId}/run-screening`);
+    },
+    runJobScreening(jobId) {
+      return api.post(`/jobs/${jobId}/screening/run`);
+    },
+    getJobTopN(jobId) {
+      return api.get(`/jobs/${jobId}/screening/top-n`);
+    },
+    updateShortlistSize(jobId, shortlistSize) {
+      return api.put(`/jobs/${jobId}/shortlist-size`, { shortlist_size: shortlistSize });
     },
     shortlistCandidate(applicationId, decision, reason = "") {
       return api.patch(`/applications/${applicationId}/shortlist`, {
         decision,
         reason,
       });
+    },
+  },
+
+  // Demo Ingestion APIs
+  demo: {
+    importResumes(jobId, file) {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("job_id", jobId);
+      return api.postForm("/demo/import-resumes", formData);
     },
   },
 

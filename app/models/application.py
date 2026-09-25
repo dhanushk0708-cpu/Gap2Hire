@@ -2,14 +2,16 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.candidate import Candidate
+    from app.models.candidate_source import CandidateSource
     from app.models.job import Job
+    from app.models.research_session import ResearchSession
 
 
 class Application(Base):
@@ -68,6 +70,13 @@ class Application(Base):
         nullable=True,
     )
 
+    is_demo: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+
     resume_path: Mapped[str | None] = mapped_column(
         String(512),
         nullable=True,
@@ -102,3 +111,14 @@ class Application(Base):
     )
 
     job: Mapped["Job"] = relationship()
+
+    sources: Mapped[list["CandidateSource"]] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+    )
+
+    research_sessions: Mapped[list["ResearchSession"]] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="ResearchSession.created_at.asc()",
+    )

@@ -11,6 +11,7 @@ from app.models.candidate import Candidate
 from app.models.job import Job
 from app.schemas.application import ApplicationCreate, ApplicationStatus, ApplicationUpdate
 from app.services.resume_processor import extract_text_from_pdf_bytes
+from app.services.resume_url_discovery import sync_resume_candidate_sources
 from app.services.storage import BaseStorageService, default_storage_service
 
 
@@ -216,4 +217,12 @@ async def process_application_resume(
     application.resume_text = extracted_text
     await session.commit()
     await session.refresh(application)
+
+    await sync_resume_candidate_sources(
+        session=session,
+        organization_id=organization_id,
+        application_id=application_id,
+        resume_text=extracted_text,
+    )
+
     return application

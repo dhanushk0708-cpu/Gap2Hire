@@ -7,21 +7,29 @@ from app.api.authorization import require_roles
 from app.core.roles import UserRole
 from app.db.session import get_db_session
 from app.models.application import Application
+from app.models.job import Job
 from app.models.user import User
+from app.schemas.job import JobResponse
 from app.schemas.screening import (
+    CandidateScreeningProfile,
     CandidateScreeningResult,
     JobCandidateListItem,
+    JobTopNResult,
     ScreeningUpdateRequest,
     ShortlistDecisionRequest,
     ShortlistDecisionResponse,
+    ShortlistSizeUpdateRequest,
 )
 from app.services.screening import (
     ApplicationNotFoundError,
     InvalidShortlistDecisionError,
     JobNotFoundError,
     apply_shortlist_decision,
+    build_candidate_screening_profile,
     build_candidate_screening_report,
+    get_job_top_n_screening_results,
     list_job_candidates_with_screening,
+    run_job_screening_workflow,
 )
 
 router = APIRouter(tags=["Candidate Screening & Shortlisting"])
@@ -190,3 +198,110 @@ async def shortlist_candidate_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
+
+
+@router.put(
+    "/api/v1/jobs/{job_id}/shortlist-size",
+    response_model=JobResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def update_job_shortlist_size_endpoint(
+    job_id: UUID,
+    body: ShortlistSizeUpdateRequest,
+    current_user: User = Depends(require_reviewer),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Configures the maximum shortlist size for a job under tenant isolation."""
+    job = await session.get(Job, job_id)
+    if not job or job.organization_id != current_user.organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found or inaccessible",
+        )
+    job.shortlist_size = body.shortlist_size
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+@router.post(
+    "/api/v1/jobs/{job_id}/screening/run",
+    response_model=JobTopNResult,
+    status_code=status.HTTP_200_OK,
+)
+async def run_job_screening_endpoint(
+    job_id: UUID,
+    current_user: User = Depends(require_reviewer),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Executes automated screening across all candidates for a job.
+    Investigates resume claims & candidate sources, extracts evidence,
+    and dynamically maintains competitive Top-N shortlist without early stopping.
+    """
+    try:
+        return await run_job_screening_workflow(
+            session=session,
+            job_id=job_id,
+            organization_id=current_user.organization_id,
+        )
+    except JobNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/api/v1/jobs/{job_id}/screening/top-n",
+    response_model=JobTopNResult,
+    status_code=status.HTTP_200_OK,
+)
+async def get_job_top_n_screening_endpoint(
+    job_id: UUID,
+    current_user: User = Depends(require_reviewer),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns the current Dynamic Top-N competitive shortlist for a job,
+    including cutoff candidate, excluded pool, and audit ranking reasons.
+    """
+    try:
+        return await get_job_top_n_screening_results(
+            session=session,
+            job_id=job_id,
+            organization_id=current_user.organization_id,
+        )
+    except JobNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/api/v1/applications/{application_id}/screening-profile",
+    response_model=CandidateScreeningProfile,
+    status_code=status.HTTP_200_OK,
+)
+async def get_candidate_screening_profile_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_reviewer),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns the multi-dimensional candidate screening profile with hard requirement coverage,
+    project vs resume evidence breakdown, unknowns, and verification needs.
+    """
+    try:
+        return await build_candidate_screening_profile(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+

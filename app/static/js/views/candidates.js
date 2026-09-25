@@ -18,17 +18,29 @@ const candidatesView = {
           <h1 style="font-size: 1.85rem; margin-bottom: 0.25rem;">Candidate Screening Queue</h1>
           <p style="color: var(--text-secondary);">Evidence coverage, capability claims, and recruiter shortlist decisions.</p>
         </div>
-        <div style="display: flex; gap: 0.75rem; align-items: center;">
+        <div style="display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;">
           <div style="min-width: 200px;">
             <select class="form-select" id="candidate-job-filter" onchange="candidatesView.onJobFilterChange(this.value)">
               <option value="">All Job Positions</option>
             </select>
           </div>
+          <div id="screening-shortlist-limit-box" style="display: flex; align-items: center; gap: 0.4rem; background: var(--bg-surface); padding: 0.35rem 0.65rem; border-radius: var(--radius-md); border: 1px solid var(--border-color);">
+            <label for="candidate-shortlist-limit" style="font-size: 0.85rem; color: var(--text-secondary); font-weight: 600; white-space: nowrap;">Shortlist Limit:</label>
+            <input type="number" id="candidate-shortlist-limit" min="1" max="100" value="5" style="width: 55px; padding: 0.2rem 0.4rem; font-size: 0.85rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--bg-surface-elevated); color: var(--text-primary); text-align: center;" onchange="candidatesView.saveShortlistLimit(this.value)" title="Configure maximum candidates to shortlist" />
+          </div>
           <button class="btn btn-primary" onclick="candidatesView.triggerLoadResumesModal(candidatesView.currentJobId)">
             <span>📥</span> Load New Resumes
           </button>
+          <button class="btn btn-secondary" style="border: 1px dashed #A855F7; color: #7E22CE; background: #FAF5FF; font-weight: 600;" onclick="candidatesView.openDemoZipModal()" title="Import synthetic candidate resumes ZIP for screening validation">
+            <span>🧪</span> Import Demo Resume ZIP
+          </button>
+          <button class="btn btn-secondary" id="btn-run-screening" onclick="candidatesView.runJobScreening()">
+            <span>⚡</span> Run Automated Screening
+          </button>
         </div>
       </div>
+
+      <div id="top-n-banner-container"></div>
 
       <div class="card" style="padding: 0; overflow: hidden;">
         <div id="candidates-table-container">
@@ -44,22 +56,62 @@ const candidatesView = {
   async loadJobsFilter() {
     try {
       const jobs = await api.jobs.list();
+      this.jobsList = jobs || [];
       const selectEl = document.getElementById("candidate-job-filter");
       if (!selectEl) return;
 
-      selectEl.innerHTML = `<option value="">All Job Positions (${jobs.length})</option>`;
-      jobs.forEach((j) => {
+      selectEl.innerHTML = `<option value="">All Job Positions (${this.jobsList.length})</option>`;
+      this.jobsList.forEach((j) => {
         const selected = j.id === this.currentJobId ? "selected" : "";
         selectEl.innerHTML += `<option value="${j.id}" ${selected}>${j.title}</option>`;
       });
+      this.syncShortlistLimitUI();
     } catch (e) {
       console.warn("Could not load jobs filter:", e);
+    }
+  },
+
+  syncShortlistLimitUI() {
+    const inputEl = document.getElementById("candidate-shortlist-limit");
+    if (!inputEl) return;
+    if (this.currentJobId && this.jobsList) {
+      const j = this.jobsList.find((item) => item.id === this.currentJobId);
+      inputEl.value = (j && j.shortlist_size) ? j.shortlist_size : 5;
+      inputEl.disabled = false;
+      inputEl.title = "Configure maximum shortlist size for this job";
+    } else {
+      inputEl.disabled = true;
+      inputEl.value = 5;
+      inputEl.title = "Select a specific job position to set shortlist limit";
+    }
+  },
+
+  async saveShortlistLimit(val) {
+    if (!this.currentJobId) {
+      toast.info("Please select a specific job position to configure shortlist limit.");
+      return;
+    }
+    const num = parseInt(val, 10);
+    if (isNaN(num) || num < 1) {
+      toast.error("Shortlist limit must be at least 1.");
+      return;
+    }
+    try {
+      await api.screening.updateShortlistSize(this.currentJobId, num);
+      if (this.jobsList) {
+        const j = this.jobsList.find((item) => item.id === this.currentJobId);
+        if (j) j.shortlist_size = num;
+      }
+      toast.success(`Shortlist limit updated to ${num}.`);
+    } catch (err) {
+      toast.error(`Failed to update shortlist limit: ${err.message}`);
     }
   },
 
   async onJobFilterChange(jobId) {
     this.currentJobId = jobId || null;
     appState.activeJobId = this.currentJobId;
+    this.syncShortlistLimitUI();
     await this.loadCandidates();
   },
 
@@ -143,8 +195,9 @@ const candidatesView = {
         html += `
           <tr>
             <td>
-              <div style="font-weight: 700; color: var(--text-primary); cursor: pointer;" onclick="router.navigate('candidate-detail', { id: '${cand.application_id}' })">
-                ${cand.candidate_name || "Applicant"}
+              <div style="font-weight: 700; color: var(--text-primary); cursor: pointer; display: flex; align-items: center; gap: 0.35rem;" onclick="router.navigate('candidate-detail', { id: '${cand.application_id}' })">
+                <span>${cand.candidate_name || "Applicant"}</span>
+                ${cand.is_demo ? `<span style="display: inline-flex; align-items: center; padding: 0.1rem 0.4rem; border-radius: 4px; font-size: 0.65rem; font-weight: 700; background: #F3E8FF; color: #7E22CE; border: 1px solid #D8B4FE;">DEMO</span>` : ''}
               </div>
               <div style="font-size: 0.8rem; color: var(--text-muted); font-family: var(--font-mono);">${cand.candidate_email}</div>
             </td>
@@ -168,7 +221,10 @@ const candidatesView = {
             <td>
               <span class="badge badge-info">${cand.screening_status || "SCREENING"}</span>
             </td>
-            <td>${shortBadge}</td>
+            <td>
+              ${shortBadge}
+              ${cand.shortlist_reason ? `<div style="font-size: 0.72rem; color: var(--text-muted); max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 0.25rem;" title="${cand.shortlist_reason.replace(/"/g, '&quot;')}">${cand.shortlist_reason}</div>` : ""}
+            </td>
             <td style="text-align: right;">
               <button class="btn btn-secondary btn-sm" onclick="router.navigate('candidate-detail', { id: '${cand.application_id}' })">
                 View Candidate →
@@ -281,4 +337,242 @@ const candidatesView = {
       }
     }
   },
+
+  async runJobScreening() {
+    if (!this.currentJobId) {
+      toast.info("Please select a specific job position to run screening.");
+      return;
+    }
+
+    const btn = document.getElementById("btn-run-screening");
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span>⏳</span> Running Screening...`;
+    }
+
+    try {
+      toast.info("Executing automated screening & dynamic Top-N selection...");
+      const result = await api.screening.runJobScreening(this.currentJobId);
+      toast.success(`Screening complete! Evaluated ${result.total_candidates_evaluated} candidates. Top-${result.shortlist_size} competitive shortlist finalized.`);
+      
+      const bannerContainer = document.getElementById("top-n-banner-container");
+      if (bannerContainer) {
+        const cutoffText = result.cutoff_candidate ? `Cutoff candidate: ${result.cutoff_candidate.candidate_name}` : "Shortlist filled";
+        bannerContainer.innerHTML = `
+          <div class="card" style="margin-bottom: 1.5rem; background: rgba(16, 185, 129, 0.08); border-color: rgba(16, 185, 129, 0.3);">
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem;">
+              <div>
+                <div style="font-weight: 700; color: #10B981; font-size: 1rem;">
+                  🏆 Dynamic Top-${result.shortlist_size} Shortlist Finalized (${result.top_n_candidates.length}/${result.shortlist_size} positions filled)
+                </div>
+                <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem;">
+                  Total evaluated: ${result.total_candidates_evaluated} • ${cutoffText} • Excluded pool: ${result.excluded_candidates.length}
+                </div>
+              </div>
+              <div>
+                <span class="badge badge-success"><span class="badge-dot"></span> Evaluated Continuously</span>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      await this.loadCandidates();
+    } catch (err) {
+      toast.error(`Screening failed: ${err.message}`);
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span>⚡</span> Run Automated Screening`;
+      }
+    }
+  },
+
+  openDemoZipModal() {
+    const activeJob = this.jobsList && this.jobsList.find((j) => j.id === this.currentJobId);
+    let jobSelectionHtml = "";
+    if (activeJob) {
+      jobSelectionHtml = `
+        <div style="background: var(--bg-surface-elevated); padding: 0.75rem 1rem; border-radius: var(--radius-md); border: 1px solid var(--border-color); margin-bottom: 1.25rem;">
+          <div style="font-size: 0.75rem; text-transform: uppercase; font-weight: 700; color: var(--text-muted); letter-spacing: 0.05em;">Target Job Position</div>
+          <div style="font-weight: 700; color: var(--text-primary); font-size: 1rem; margin-top: 0.2rem;">${activeJob.title}</div>
+          <input type="hidden" id="demo-import-job-id" value="${activeJob.id}" />
+        </div>
+      `;
+    } else {
+      let options = (this.jobsList || []).map((j) => `<option value="${j.id}">${j.title}</option>`).join("");
+      jobSelectionHtml = `
+        <div class="form-group" style="margin-bottom: 1.25rem;">
+          <label class="form-label" for="demo-import-job-id">Select Target Job Position</label>
+          <select class="form-select" id="demo-import-job-id">
+            ${options || '<option value="">No jobs available</option>'}
+          </select>
+        </div>
+      `;
+    }
+
+    modal.open(`
+      <div class="modal-header">
+        <h3 class="modal-title" style="display: flex; align-items: center; gap: 0.5rem;">
+          <span>🧪</span> Import Demo Resume ZIP (Algorithm Validation)
+        </h3>
+        <button class="btn btn-outline btn-sm" onclick="modal.close()">✕</button>
+      </div>
+      <div>
+        <div style="background: #FAF5FF; border: 1px solid #E9D5FF; border-radius: var(--radius-md); padding: 0.85rem 1rem; margin-bottom: 1.25rem; font-size: 0.85rem; color: #6B21A8; line-height: 1.45;">
+          <strong>Development & Algorithm Validation:</strong> Upload a ZIP containing synthetic resumes (e.g. <code>Gap2Hire_50_Fake_Resumes.zip</code>) to evaluate the automated screening engine and Dynamic Top-N selection against ~50 candidate profiles. Imported candidates are tagged as <strong>DEMO</strong> and will not interfere with real Gmail applicant pipelines.
+        </div>
+
+        ${jobSelectionHtml}
+
+        <!-- File Upload Area -->
+        <div id="demo-drop-zone" onclick="document.getElementById('demo-zip-file-input').click()" style="border: 2px dashed #A855F7; background: #FAF5FF; padding: 2rem 1.5rem; text-align: center; border-radius: var(--radius-md); cursor: pointer; transition: all 0.2s ease;">
+          <div style="font-size: 2.2rem; margin-bottom: 0.5rem;">📦</div>
+          <div style="font-weight: 700; color: #7E22CE; font-size: 0.95rem;">
+            Click to select <code>Gap2Hire_50_Fake_Resumes.zip</code>
+          </div>
+          <div style="font-size: 0.8rem; color: #9333EA; margin-top: 0.35rem;">
+            ZIP archives only • Up to 50 MB • Validates safe path traversal & extracts PDFs safely
+          </div>
+          <input type="file" id="demo-zip-file-input" accept=".zip" style="display: none;" onchange="candidatesView.onDemoZipSelected(this)" />
+        </div>
+
+        <!-- Selected File Info (hidden until file chosen) -->
+        <div id="demo-file-info" style="display: none; margin-top: 1rem; padding: 0.85rem 1rem; background: var(--bg-surface-elevated); border: 1px solid var(--border-color); border-radius: var(--radius-md);">
+          <div style="display: flex; align-items: center; justify-content: space-between;">
+            <div>
+              <div style="font-weight: 700; font-size: 0.9rem; color: var(--text-primary);" id="demo-file-name">Gap2Hire_50_Fake_Resumes.zip</div>
+              <div style="font-size: 0.8rem; color: var(--text-muted);" id="demo-file-meta">-</div>
+            </div>
+            <span class="badge badge-info">Ready to Ingest</span>
+          </div>
+        </div>
+
+        <!-- Progress Indicator -->
+        <div id="demo-progress-area" style="display: none; margin: 1.5rem 0; padding: 1.25rem; background: var(--bg-surface-elevated); border-radius: var(--radius-md); border: 1px solid var(--border-color);">
+          <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem;">
+            <div style="font-size: 1.2rem; animation: spin 1.5s linear infinite;">⏳</div>
+            <div style="font-weight: 600; font-size: 0.9rem; color: var(--text-primary);" id="demo-progress-msg">
+              Unpacking ZIP & processing synthetic resumes...
+            </div>
+          </div>
+          <div style="font-size: 0.8rem; color: var(--text-secondary);">
+            Extracting text with PyMuPDF • Deriving deterministic demo emails • Grounding capability evidence • Registering candidate profiles...
+          </div>
+        </div>
+
+        <!-- Result Summary -->
+        <div id="demo-result-area" style="display: none; margin: 1.5rem 0;"></div>
+
+        <div class="modal-footer" id="demo-modal-footer">
+          <button type="button" class="btn btn-outline" onclick="modal.close()">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-start-demo-import" disabled onclick="candidatesView.executeDemoZipImport()">
+            Import & Process Resumes
+          </button>
+        </div>
+      </div>
+    `);
+  },
+
+  onDemoZipSelected(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      toast.error("Please select a valid .zip archive.");
+      input.value = "";
+      return;
+    }
+
+    const infoEl = document.getElementById("demo-file-info");
+    const nameEl = document.getElementById("demo-file-name");
+    const metaEl = document.getElementById("demo-file-meta");
+    const startBtn = document.getElementById("btn-start-demo-import");
+
+    if (infoEl) infoEl.style.display = "block";
+    if (nameEl) nameEl.textContent = file.name;
+    if (metaEl) metaEl.textContent = `${(file.size / 1024).toFixed(1)} KB • Application archive ready`;
+    if (startBtn) {
+      startBtn.disabled = false;
+      startBtn.textContent = `Import & Ingest "${file.name}"`;
+    }
+  },
+
+  async executeDemoZipImport() {
+    const input = document.getElementById("demo-zip-file-input");
+    const file = input && input.files && input.files[0];
+    const jobSelect = document.getElementById("demo-import-job-id");
+    const jobId = jobSelect ? jobSelect.value : this.currentJobId;
+
+    if (!file) {
+      toast.error("Please choose a ZIP file to import.");
+      return;
+    }
+
+    if (!jobId) {
+      toast.error("Please select a target job position.");
+      return;
+    }
+
+    const startBtn = document.getElementById("btn-start-demo-import");
+    const progressArea = document.getElementById("demo-progress-area");
+    const resultArea = document.getElementById("demo-result-area");
+    const footer = document.getElementById("demo-modal-footer");
+    const dropZone = document.getElementById("demo-drop-zone");
+    const fileInfo = document.getElementById("demo-file-info");
+
+    if (startBtn) startBtn.disabled = true;
+    if (dropZone) dropZone.style.display = "none";
+    if (fileInfo) fileInfo.style.display = "none";
+    if (progressArea) progressArea.style.display = "block";
+    if (resultArea) resultArea.style.display = "none";
+
+    try {
+      const res = await api.demo.importResumes(jobId, file);
+
+      if (progressArea) progressArea.style.display = "none";
+      if (resultArea) {
+        resultArea.style.display = "block";
+        resultArea.innerHTML = `
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-md); padding: 1.25rem;">
+            <h4 style="color: #10B981; margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;">
+              <span>✅</span> Demo Resumes Ingestion Completed
+            </h4>
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.75rem; font-size: 0.875rem;">
+              <div><strong>PDF Resumes Discovered:</strong> ${res.total_found}</div>
+              <div><strong>Demo Candidates Created:</strong> <span style="color: #059669; font-weight: 700;">${res.created}</span></div>
+              <div><strong>Duplicates Skipped:</strong> ${res.skipped_duplicates}</div>
+              <div><strong>Failed:</strong> ${res.failed}</div>
+            </div>
+            <div style="margin-top: 0.75rem; font-size: 0.8rem; color: #047857;">
+              ${res.message}
+            </div>
+          </div>
+        `;
+      }
+
+      if (footer) {
+        footer.innerHTML = `
+          <button type="button" class="btn btn-primary" onclick="modal.close(); candidatesView.loadCandidates();">
+            View Screening Queue (${res.created} New Demo Candidates)
+          </button>
+        `;
+      }
+
+      toast.success(`Demo import successful! ${res.created} candidates created (${res.skipped_duplicates} duplicates skipped).`);
+      this.currentJobId = jobId;
+    } catch (err) {
+      if (progressArea) progressArea.style.display = "none";
+      if (dropZone) dropZone.style.display = "block";
+      if (fileInfo) fileInfo.style.display = "block";
+      toast.error(`Demo import failed: ${err.message}`);
+      if (startBtn) {
+        startBtn.disabled = false;
+        startBtn.textContent = "Retry Import";
+      }
+    }
+  },
 };
+
+window.candidatesView = candidatesView;
+window.CandidatesView = candidatesView;

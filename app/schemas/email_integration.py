@@ -25,7 +25,7 @@ class EmailAttachment(BaseModel):
     content_type: str = "application/octet-stream"
     size: int = 0
     provider_attachment_id: str
-    content: bytes | None = None
+    content: bytes | None = Field(default=None, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

@@ -4,22 +4,40 @@
 
 const router = {
   routes: {
-    auth: () => (window.authView || window.AuthView).render(),
-    dashboard: () => (window.dashboardView || window.DashboardView).render(),
-    jobs: () => (window.jobsView || window.JobsView).renderList(),
-    "job-detail": (params) => (window.jobsView || window.JobsView).renderDetail(params.id || (window.appState && window.appState.activeJobId)),
-    candidates: (params) => (window.candidatesView || window.CandidatesView).render(params),
-    "candidate-detail": (params) => (window.candidateDetailView || window.CandidateDetailView).render(params.id || (window.appState && window.appState.activeApplicationId)),
+    auth: () => {
+      const v = window.authView || window.AuthView || (typeof authView !== "undefined" ? authView : null);
+      if (v && v.render) v.render();
+    },
+    dashboard: () => {
+      const v = window.dashboardView || window.DashboardView || (typeof dashboardView !== "undefined" ? dashboardView : null);
+      if (v && v.render) v.render();
+    },
+    jobs: () => {
+      const v = window.jobsView || window.JobsView || (typeof jobsView !== "undefined" ? jobsView : null);
+      if (v && v.renderList) v.renderList();
+    },
+    "job-detail": (params) => {
+      const v = window.jobsView || window.JobsView || (typeof jobsView !== "undefined" ? jobsView : null);
+      if (v && v.renderDetail) v.renderDetail(params.id || (window.appState && window.appState.activeJobId));
+    },
+    candidates: (params) => {
+      const v = window.candidatesView || window.CandidatesView || (typeof candidatesView !== "undefined" ? candidatesView : null);
+      if (v && v.render) v.render(params);
+    },
+    "candidate-detail": (params) => {
+      const v = window.candidateDetailView || window.CandidateDetailView || (typeof candidateDetailView !== "undefined" ? candidateDetailView : null);
+      if (v && v.render) v.render(params.id || (window.appState && window.appState.activeApplicationId));
+    },
     "interview-setup": (params) => {
-      const v = window.interviewSetupView || window.InterviewSetupView;
+      const v = window.interviewSetupView || window.InterviewSetupView || (typeof interviewSetupView !== "undefined" ? interviewSetupView : null);
       if (v && v.render) v.render(document.getElementById("main-view"), params);
     },
     "interview-live": (params) => {
-      const v = window.interviewLiveView || window.InterviewLiveView;
+      const v = window.interviewLiveView || window.InterviewLiveView || (typeof interviewLiveView !== "undefined" ? interviewLiveView : null);
       if (v && v.render) v.render(document.getElementById("main-view"), params);
     },
     "interview-report": (params) => {
-      const v = window.interviewReportView || window.InterviewReportView;
+      const v = window.interviewReportView || window.InterviewReportView || (typeof interviewReportView !== "undefined" ? interviewReportView : null);
       if (v && v.render) v.render(document.getElementById("main-view"), params);
     },
   },

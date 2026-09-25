@@ -222,7 +222,8 @@ async def test_candidate_intake_result_and_idempotency():
         assert res2.is_existing_application is True
         assert res2.candidate_id == first_candidate_id
         assert res2.application_id == first_app_id
-        assert res2.should_process_resume is True
+        assert res2.should_process_resume is False
+        assert res2.intake_status == "SKIPPED"
 
 
 # 10. Tenant isolation verification
@@ -282,3 +283,158 @@ async def test_tenant_isolation():
         )
         conns_a_after = await list_email_connections(session=session, organization_id=org_a_id)
         assert len(conns_a_after) == 0
+
+
+# 11. Google OAuth Redirect URI Mismatch Fix Verification
+def test_google_oauth_canonical_redirect_uri():
+    import urllib.parse
+    from app.services.gmail_provider import get_google_auth_url, get_google_redirect_uri
+
+    redirect_uri = get_google_redirect_uri()
+    expected_canonical_uri = "http://localhost:8000/api/v1/email-connections/oauth/callback"
+    assert redirect_uri == expected_canonical_uri
+
+    auth_url = get_google_auth_url(state="test-org-123")
+    parsed_url = urllib.parse.urlparse(auth_url)
+    query_params = urllib.parse.parse_qs(parsed_url.query)
+
+    assert "redirect_uri" in query_params
+    assert query_params["redirect_uri"][0] == expected_canonical_uri
+
+
+def test_fastapi_callback_route_exists():
+    from app.main import app
+
+    paths = list(app.openapi()["paths"].keys())
+    expected_callback_path = "/api/v1/email-connections/oauth/callback"
+    assert expected_callback_path in paths, f"Expected route {expected_callback_path} not found in FastAPI OpenAPI schema paths: {paths}"
+
+
+# 12. Gmail message parsing with RFC 2047 MIME headers and UTF-8 text
+def test_gmail_message_parsing_utf8_and_mime_headers():
+    from app.services.gmail_provider import decode_mime_header, decode_text_bytes, clean_html_to_text
+
+    # RFC 2047 encoded header
+    encoded_subject = "=?UTF-8?B?QXBwbGljYXRpb24gZm9yIFNlbmlvciBFbmdpbmVlcg==?="
+    assert decode_mime_header(encoded_subject) == "Application for Senior Engineer"
+
+    # HTML to text clean
+    html_sample = "<p>Dear Hiring Team,<br>Please find my resume attached.</p>"
+    cleaned = clean_html_to_text(html_sample)
+    assert "Dear Hiring Team," in cleaned
+    assert "Please find my resume attached." in cleaned
+
+
+# 13. Gmail message containing non-UTF-8 / ISO-8859-1 text
+def test_gmail_message_non_utf8_charset():
+    from app.services.gmail_provider import decode_text_bytes
+
+    # ISO-8859-1 encoded string with accented character (e.g., José)
+    latin1_bytes = "Resume of José Müller".encode("iso-8859-1")
+    decoded = decode_text_bytes(latin1_bytes, charset="iso-8859-1")
+    assert "José Müller" in decoded
+
+    # Malformed bytes fallback
+    malformed_bytes = b"Test malformed \xff\xfe bytes"
+    decoded_fallback = decode_text_bytes(malformed_bytes, charset="utf-8")
+    assert "Test malformed" in decoded_fallback
+
+
+# 14. Gmail message with binary PDF attachment
+def test_gmail_message_with_binary_pdf_attachment():
+    import base64
+    from app.schemas.email_integration import EmailAttachment
+    from app.services.gmail_provider import safe_b64url_decode
+
+    binary_pdf = b"%PDF-1.4\n\xff\xfe\xfd\xfc binary content stream"
+    b64_data = base64.urlsafe_b64encode(binary_pdf).decode("ascii")
+
+    decoded_bytes = safe_b64url_decode(b64_data)
+    assert decoded_bytes == binary_pdf
+
+    att = EmailAttachment(
+        filename="candidate_resume.pdf",
+        content_type="application/pdf",
+        size=len(binary_pdf),
+        provider_attachment_id="att-pdf-01",
+        content=binary_pdf,
+    )
+    # Binary bytes are preserved in memory
+    assert att.content == binary_pdf
+
+
+# 15. Gmail message with multiple attachments
+def test_gmail_message_with_multiple_attachments():
+    from app.schemas.email_integration import EmailAttachment
+    from app.services.email_classifier import find_primary_resume
+
+    pdf_att = EmailAttachment(
+        filename="resume.pdf",
+        content_type="application/pdf",
+        size=1024,
+        provider_attachment_id="att-1",
+        content=b"%PDF-1.4\n\x80\x81 binary resume",
+    )
+    img_att = EmailAttachment(
+        filename="portfolio.png",
+        content_type="image/png",
+        size=2048,
+        provider_attachment_id="att-2",
+        content=b"\x89PNG\r\n\x1a\n binary image",
+    )
+
+    primary, cls = find_primary_resume([img_att, pdf_att])
+    assert primary is not None
+    assert primary.filename == "resume.pdf"
+
+
+# 16. Batch sync response JSON serialization with binary data (Pydantic safety)
+def test_batch_sync_response_json_serialization_with_binary_data():
+    import json
+    from app.schemas.email_integration import (
+        BatchEmailSyncResponse,
+        EmailAttachment,
+        EmailClassificationEnum,
+        EmailIntakeResult,
+    )
+
+    binary_pdf = b"%PDF-1.4\n\xed\xf2\x90\xaa arbitrary binary non-utf8 data"
+    att = EmailAttachment(
+        filename="resume.pdf",
+        content_type="application/pdf",
+        size=len(binary_pdf),
+        provider_attachment_id="att-real-01",
+        content=binary_pdf,
+    )
+
+    result = EmailIntakeResult(
+        email_id="gmail-msg-12345",
+        classification=EmailClassificationEnum.CANDIDATE_APPLICATION,
+        confidence="HIGH",
+        candidate_email="applicant@example.com",
+        candidate_name="Jane Applicant",
+        primary_attachment=att,
+        attachment_count=1,
+        should_process_resume=True,
+        intake_status="PROCESSED",
+        reason="Valid resume found",
+    )
+
+    batch_response = BatchEmailSyncResponse(
+        emails_fetched=1,
+        candidate_emails=1,
+        resumes_found=1,
+        resumes_processed=1,
+        details=[result],
+    )
+
+    # Must serialize to valid JSON without PydanticSerializationError
+    json_str = batch_response.model_dump_json()
+    assert json_str is not None
+    parsed = json.loads(json_str)
+    assert parsed["emails_fetched"] == 1
+    assert parsed["details"][0]["candidate_name"] == "Jane Applicant"
+    assert parsed["details"][0]["primary_attachment"]["filename"] == "resume.pdf"
+    # Ensure binary content was not serialized into JSON
+    assert "content" not in parsed["details"][0]["primary_attachment"]
+

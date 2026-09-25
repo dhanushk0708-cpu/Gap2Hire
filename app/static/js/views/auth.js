@@ -105,3 +105,6 @@ const authView = {
     }
   },
 };
+
+window.authView = authView;
+window.AuthView = authView;

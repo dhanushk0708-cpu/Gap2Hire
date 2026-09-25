@@ -1,8 +1,12 @@
 import base64
 from datetime import datetime, timezone
+from email.header import decode_header
+from email.utils import parseaddr
+import html
 import json
 import logging
 import os
+import re
 from typing import Any
 import urllib.parse
 
@@ -14,6 +18,99 @@ from app.services.email_provider import EmailProvider
 logger = logging.getLogger(__name__)
 
 GOOGLE_OAUTH_PATH = os.path.join(os.getcwd(), "credentials", "google-oauth.json")
+DEFAULT_REDIRECT_URI = "http://localhost:8000/api/v1/email-connections/oauth/callback"
+
+
+def decode_mime_header(header_value: str | None) -> str:
+    """Safely decodes an RFC 2047 encoded email header (e.g. =?UTF-8?B?...?=) into a valid string."""
+    if not header_value:
+        return ""
+    try:
+        decoded_parts = decode_header(header_value)
+        result = []
+        for part, encoding in decoded_parts:
+            if isinstance(part, bytes):
+                enc = encoding or "utf-8"
+                try:
+                    result.append(part.decode(enc, errors="replace"))
+                except Exception:
+                    result.append(part.decode("utf-8", errors="replace"))
+            else:
+                result.append(str(part))
+        return "".join(result)
+    except Exception:
+        return str(header_value)
+
+
+def safe_b64url_decode(raw_data: str | None) -> bytes | None:
+    """Safely decodes base64url data from Gmail API, ensuring correct padding and error recovery."""
+    if not raw_data:
+        return None
+    try:
+        padded = raw_data + "=" * ((4 - len(raw_data) % 4) % 4)
+        return base64.urlsafe_b64decode(padded)
+    except Exception as exc:
+        try:
+            padded = raw_data + "=" * ((4 - len(raw_data) % 4) % 4)
+            return base64.b64decode(padded)
+        except Exception:
+            logger.warning(f"Could not b64-decode Gmail data: {exc}")
+            return None
+
+
+def get_part_charset(part: dict[str, Any]) -> str:
+    """Extracts the character encoding from part headers, default to utf-8."""
+    for h in part.get("headers", []):
+        if h.get("name", "").lower() == "content-type":
+            val = h.get("value", "")
+            match = re.search(r'charset=["\']?([^"\';\s]+)', val, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+    return "utf-8"
+
+
+def decode_text_bytes(raw_bytes: bytes, charset: str = "utf-8") -> str:
+    """Decodes raw text bytes using the specified charset with multi-level safe fallback."""
+    if not raw_bytes:
+        return ""
+    if charset:
+        try:
+            return raw_bytes.decode(charset, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            pass
+    try:
+        return raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        return raw_bytes.decode("latin-1", errors="replace")
+    except Exception:
+        return ""
+
+
+def clean_html_to_text(html_content: str) -> str:
+    """Converts HTML email body into clean readable plain text."""
+    if not html_content:
+        return ""
+    text = re.sub(r'<br\s*/?>', '\n', html_content, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html.unescape(text)
+    return text.strip()
+
+
+def get_google_redirect_uri(cfg: dict[str, Any] | None = None) -> str:
+    """Returns the canonical Google OAuth redirect URI."""
+    if os.getenv("GOOGLE_REDIRECT_URI"):
+        return os.getenv("GOOGLE_REDIRECT_URI", DEFAULT_REDIRECT_URI)
+
+    if cfg and "redirect_uris" in cfg and isinstance(cfg["redirect_uris"], list) and cfg["redirect_uris"]:
+        uri = cfg["redirect_uris"][0]
+        if "/api/v1/email/oauth/callback" in uri:
+            return uri.replace("/api/v1/email/oauth/callback", "/api/v1/email-connections/oauth/callback")
+        return uri
+
+    return DEFAULT_REDIRECT_URI
 
 
 def load_google_oauth_config() -> dict[str, Any]:
@@ -31,7 +128,7 @@ def load_google_oauth_config() -> dict[str, Any]:
         "client_secret": os.getenv("GOOGLE_CLIENT_SECRET", ""),
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
-        "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/api/v1/email/oauth/callback")],
+        "redirect_uris": [DEFAULT_REDIRECT_URI],
     }
 
 
@@ -39,7 +136,7 @@ def get_google_auth_url(state: str = "") -> str:
     """Constructs the Google OAuth authorization consent URL."""
     cfg = load_google_oauth_config()
     client_id = cfg.get("client_id", "")
-    redirect_uri = cfg.get("redirect_uris", ["http://localhost:8000/api/v1/email/oauth/callback"])[0]
+    redirect_uri = get_google_redirect_uri(cfg)
     scope = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email"
 
     params = {
@@ -58,7 +155,7 @@ async def exchange_google_code_for_tokens(code: str) -> dict[str, Any]:
     """Exchanges an authorization code for Google access and refresh tokens."""
     cfg = load_google_oauth_config()
     token_uri = cfg.get("token_uri", "https://oauth2.googleapis.com/token")
-    redirect_uri = cfg.get("redirect_uris", ["http://localhost:8000/api/v1/email/oauth/callback"])[0]
+    redirect_uri = get_google_redirect_uri(cfg)
 
     data = {
         "code": code,
@@ -169,17 +266,20 @@ class GmailProvider(EmailProvider):
             headers_dict = {h.get("name", "").lower(): h.get("value", "") for h in headers_list}
 
             # Parse sender
-            from_header = headers_dict.get("from", "")
-            sender_name = from_header
-            sender_email = from_header
-            if "<" in from_header and ">" in from_header:
-                parts = from_header.split("<")
-                sender_name = parts[0].strip(' "')
-                sender_email = parts[1].split(">")[0].strip()
+            from_raw = headers_dict.get("from", "")
+            from_decoded = decode_mime_header(from_raw)
+            sender_name, sender_email = parseaddr(from_decoded)
+            if not sender_email:
+                sender_email = from_decoded.strip()
+            if not sender_name:
+                sender_name = sender_email
 
-            subject = headers_dict.get("subject", "(No Subject)")
-            to_header = headers_dict.get("to", self.account_email)
-            recipient_emails = [e.strip() for e in to_header.split(",") if e.strip()]
+            subject_raw = headers_dict.get("subject", "(No Subject)")
+            subject = decode_mime_header(subject_raw)
+
+            to_raw = headers_dict.get("to", self.account_email)
+            to_decoded = decode_mime_header(to_raw)
+            recipient_emails = [parseaddr(e.strip())[1] or e.strip() for e in to_decoded.split(",") if e.strip()]
 
             # Date
             internal_date_ms = int(msg.get("internalDate", "0"))
@@ -189,53 +289,68 @@ class GmailProvider(EmailProvider):
                 received_at = datetime.now(tz=timezone.utc)
 
             # Traverse body and attachments
-            body_text = ""
+            plain_texts: list[str] = []
+            html_texts: list[str] = []
             attachments: list[EmailAttachment] = []
 
             def _traverse_parts(part: dict[str, Any]):
-                nonlocal body_text
-                mime_type = part.get("mimeType", "")
-                filename = part.get("filename", "")
+                mime_type = part.get("mimeType", "").lower()
+                filename_raw = part.get("filename", "")
+                filename = decode_mime_header(filename_raw)
                 body = part.get("body", {})
+                att_id = body.get("attachmentId")
+                raw_data = body.get("data")
 
-                if filename:
+                if filename or att_id or (mime_type and not mime_type.startswith("text/") and not mime_type.startswith("multipart/")):
                     # It's an attachment
-                    att_id = body.get("attachmentId") or f"att-{len(attachments)}"
+                    attachment_id = att_id or f"att-{len(attachments)}"
                     size = body.get("size", 0)
-                    raw_data = body.get("data")
-                    content_bytes = None
-                    if raw_data:
-                        try:
-                            content_bytes = base64.urlsafe_b64decode(raw_data + "==")
-                        except Exception:
-                            pass
+                    content_bytes = safe_b64url_decode(raw_data) if raw_data else None
 
                     attachments.append(
                         EmailAttachment(
-                            filename=filename,
+                            filename=filename or f"attachment-{len(attachments)+1}",
                             content_type=mime_type or "application/octet-stream",
-                            size=size,
-                            provider_attachment_id=att_id,
+                            size=size or (len(content_bytes) if content_bytes else 0),
+                            provider_attachment_id=attachment_id,
                             content=content_bytes,
                         )
                     )
-                elif mime_type == "text/plain" and body.get("data"):
-                    try:
-                        decoded_body = base64.urlsafe_b64decode(body["data"] + "==").decode("utf-8", errors="replace")
-                        body_text += decoded_body + "\n"
-                    except Exception:
-                        pass
+                elif mime_type == "text/plain" and raw_data:
+                    charset = get_part_charset(part)
+                    data_bytes = safe_b64url_decode(raw_data)
+                    if data_bytes:
+                        decoded_text = decode_text_bytes(data_bytes, charset)
+                        if decoded_text:
+                            plain_texts.append(decoded_text)
+                elif mime_type == "text/html" and raw_data:
+                    charset = get_part_charset(part)
+                    data_bytes = safe_b64url_decode(raw_data)
+                    if data_bytes:
+                        decoded_html = decode_text_bytes(data_bytes, charset)
+                        if decoded_html:
+                            html_texts.append(clean_html_to_text(decoded_html))
 
                 for sub in part.get("parts", []):
                     _traverse_parts(sub)
 
             _traverse_parts(payload)
 
+            # Combine body text (prefer plain text, fallback to HTML text)
+            if plain_texts:
+                body_text = "\n\n".join(plain_texts).strip()
+            elif html_texts:
+                body_text = "\n\n".join(html_texts).strip()
+            else:
+                body_text = ""
+
             # Fetch any external attachment bodies missing content
             for att in attachments:
-                if att.content is None and att.provider_attachment_id:
+                if att.content is None and att.provider_attachment_id and not att.provider_attachment_id.startswith("att-"):
                     try:
                         att.content = await self.get_attachment(external_id, att.provider_attachment_id)
+                        if att.content and not att.size:
+                            att.size = len(att.content)
                     except Exception as e:
                         logger.warning(f"Error fetching attachment {att.filename}: {e}")
 
@@ -246,7 +361,7 @@ class GmailProvider(EmailProvider):
                 sender_name=sender_name or sender_email,
                 recipient_emails=recipient_emails,
                 subject=subject,
-                body_text=body_text.strip(),
+                body_text=body_text,
                 received_at=received_at,
                 attachments=attachments,
                 metadata={"gmail_thread_id": msg.get("threadId")},
@@ -271,5 +386,6 @@ class GmailProvider(EmailProvider):
             data = resp.json()
             raw_b64 = data.get("data")
             if raw_b64:
-                return base64.urlsafe_b64decode(raw_b64 + "==")
+                return safe_b64url_decode(raw_b64)
             return None
+

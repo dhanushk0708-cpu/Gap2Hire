@@ -89,12 +89,15 @@ const jobsView = {
           <a href="javascript:void(0)" onclick="router.navigate('jobs')" style="font-size: 0.875rem; color: var(--text-muted);">← All Jobs</a>
         </div>
         <div style="display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 1rem;">
-          <div>
             <div style="display: flex; align-items: center; gap: 0.75rem;">
               <h1 id="job-title" style="font-size: 2rem;">Loading Job...</h1>
               <span id="job-status-badge" class="badge badge-neutral">Draft</span>
             </div>
             <p id="job-meta" style="color: var(--text-muted); font-size: 0.875rem; margin-top: 0.25rem;">ID: ${jobId}</p>
+            <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem;">
+              <span style="font-size: 0.85rem; color: var(--text-secondary); font-weight: 600;">Top-N Shortlist Target:</span>
+              <input type="number" id="job-shortlist-input" min="1" max="100" style="width: 65px; padding: 0.2rem 0.4rem; font-size: 0.85rem; border-radius: var(--radius-sm); border: 1px solid var(--border-color); background: var(--bg-surface); color: var(--text-primary);" onchange="jobsView.saveShortlistSize('${jobId}', this.value)" />
+            </div>
           </div>
           <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
             <button class="btn btn-secondary" onclick="candidatesView.triggerLoadResumesModal('${jobId}')">
@@ -229,13 +232,23 @@ const jobsView = {
         if (inboxEl && conns && conns.length > 0) {
           inboxEl.innerHTML = `Application intake email: <strong style="color: var(--primary-light);">${conns[0].account_email}</strong> (Provider: ${conns[0].provider})`;
         }
-      } catch (e) {
-        console.log("Could not load connection:", e);
-      }
+      const shortlistInput = document.getElementById("job-shortlist-input");
+      if (shortlistInput) shortlistInput.value = this.currentJob.shortlist_size || 5;
 
       this.renderApprovedCapabilities();
     } catch (err) {
       toast.error(`Failed to load job details: ${err.message}`);
+    }
+  },
+
+  async saveShortlistSize(jobId, size) {
+    try {
+      const num = parseInt(size, 10);
+      if (!num || num < 1) return;
+      await api.screening.updateShortlistSize(jobId, num);
+      toast.success(`Shortlist size updated to Top-${num}`);
+    } catch (err) {
+      toast.error(`Failed to update shortlist size: ${err.message}`);
     }
   },
 
@@ -432,6 +445,11 @@ const jobsView = {
           <label class="form-label" for="job-input-desc">Job Description</label>
           <textarea class="form-textarea" id="job-input-desc" placeholder="Paste full job description requirements here..." rows="8" required></textarea>
         </div>
+        <div class="form-group">
+          <label class="form-label" for="job-input-shortlist">Shortlist Limit (Top-N Max Candidates)</label>
+          <input type="number" class="form-input" id="job-input-shortlist" value="5" min="1" max="100" />
+          <small style="color: var(--text-muted); font-size: 0.8rem;">Maximum candidates to shortlist during automated screening (capacity ceiling, not a quota).</small>
+        </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-outline" onclick="modal.close()">Cancel</button>
           <button type="submit" class="btn btn-primary" id="btn-create-job-submit">Create & Open Blueprint</button>
@@ -450,9 +468,10 @@ const jobsView = {
 
     const title = document.getElementById("job-input-title").value.trim();
     const description = document.getElementById("job-input-desc").value.trim();
+    const shortlistSize = parseInt(document.getElementById("job-input-shortlist")?.value || "5", 10);
 
     try {
-      const job = await api.jobs.create(title, description);
+      const job = await api.jobs.create(title, description, shortlistSize);
       modal.close();
       toast.success(`Job '${job.title}' created successfully.`);
       router.navigate("job-detail", { id: job.id });
@@ -514,3 +533,6 @@ const jobsView = {
     }
   },
 };
+
+window.jobsView = jobsView;
+window.JobsView = jobsView;

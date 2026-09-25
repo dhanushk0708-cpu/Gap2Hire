@@ -365,3 +365,5 @@ window.InterviewSetupView = {
         }
     }
 };
+
+window.interviewSetupView = window.InterviewSetupView;

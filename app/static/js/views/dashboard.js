@@ -169,3 +169,6 @@ const dashboardView = {
     }
   },
 };
+
+window.dashboardView = dashboardView;
+window.DashboardView = dashboardView;
