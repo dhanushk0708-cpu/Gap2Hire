@@ -13,9 +13,9 @@ Gap2Hire will evaluate:
 * Candidate evidence classification
 * Gap and uncertainty identification
 * Verification recommendations
-* AI interview relevance
-* RAG answer accuracy
-* Personalized training recommendations
+* AI interview relevance & dynamic follow-up probing
+* Post-interview evidence report synthesis
+* Hiring autopsy evidence comparison & advisory process suggestions (strictly advisory, non-blaming, traceable to recorded data)
 
 ## 3. Evaluation Criteria
 

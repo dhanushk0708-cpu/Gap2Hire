@@ -9,8 +9,10 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.candidate import Candidate
+    from app.models.candidate_hiring_decision import CandidateHiringDecision
     from app.models.candidate_source import CandidateSource
     from app.models.job import Job
+    from app.models.post_hire_outcome import PostHireOutcome
     from app.models.research_session import ResearchSession
 
 
@@ -121,4 +123,16 @@ class Application(Base):
         back_populates="application",
         cascade="all, delete-orphan",
         order_by="ResearchSession.created_at.asc()",
+    )
+
+    hiring_decisions: Mapped[list["CandidateHiringDecision"]] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="CandidateHiringDecision.decided_at.desc()",
+    )
+
+    post_hire_outcomes: Mapped[list["PostHireOutcome"]] = relationship(
+        back_populates="application",
+        cascade="all, delete-orphan",
+        order_by="PostHireOutcome.recorded_at.desc()",
     )

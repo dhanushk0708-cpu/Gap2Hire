@@ -37,6 +37,9 @@ const candidatesView = {
           <button class="btn btn-secondary" id="btn-run-screening" onclick="candidatesView.runJobScreening()">
             <span>⚡</span> Run Automated Screening
           </button>
+          <button class="btn btn-primary" style="background: #0284C7; border: 1px solid #0369A1; font-weight: 600;" onclick="candidatesView.openBatchInterviewModal()" title="Start concurrent independent interview sessions for shortlisted candidates">
+            <span>👥</span> Batch Interviews
+          </button>
         </div>
       </div>
 
@@ -251,7 +254,7 @@ const candidatesView = {
         <p style="color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1.5rem;">
           Gap2Hire will fetch a bounded batch of incoming emails from the configured inbox, classify attachments, extract resume evidence, and prepare candidates for screening with full idempotency.
         </p>
-        
+
         <div class="form-group">
           <label class="form-label" for="sync-limit">Batch Size Limit (Max emails to fetch)</label>
           <select class="form-select" id="sync-limit">
@@ -354,7 +357,7 @@ const candidatesView = {
       toast.info("Executing automated screening & dynamic Top-N selection...");
       const result = await api.screening.runJobScreening(this.currentJobId);
       toast.success(`Screening complete! Evaluated ${result.total_candidates_evaluated} candidates. Top-${result.shortlist_size} competitive shortlist finalized.`);
-      
+
       const bannerContainer = document.getElementById("top-n-banner-container");
       if (bannerContainer) {
         const cutoffText = result.cutoff_candidate ? `Cutoff candidate: ${result.cutoff_candidate.candidate_name}` : "Shortlist filled";
@@ -569,6 +572,141 @@ const candidatesView = {
       if (startBtn) {
         startBtn.disabled = false;
         startBtn.textContent = "Retry Import";
+      }
+    }
+  },
+
+  openBatchInterviewModal() {
+    const shortlistedCandidates = (this.candidates || []).filter(
+      (c) => c.shortlist_status === "SHORTLISTED"
+    );
+
+    if (shortlistedCandidates.length === 0) {
+      toast.info("No shortlisted candidates found. Please shortlist candidates before starting batch interviews.");
+      return;
+    }
+
+    modal.open(`
+      <div class="modal-header">
+        <h3 class="modal-title">👥 Start Concurrent Independent Interviews</h3>
+        <button class="btn btn-outline btn-sm" onclick="modal.close()">✕</button>
+      </div>
+      <div style="padding-top: 0.5rem;">
+        <p style="color: var(--text-secondary); font-size: 0.88rem; margin-bottom: 1.25rem;">
+          Select shortlisted candidates to initialize independent interview sessions with isolated LangGraph threads, dedicated question pools, and separate live rooms.
+        </p>
+
+        <div class="form-group" style="margin-bottom: 1.25rem;">
+          <label class="form-label" style="font-weight: 600; font-size: 0.88rem;">
+            Concurrency Capacity (Simultaneous Interview Capacity)
+          </label>
+          <select class="form-select" id="batch-concurrency-select" style="width: 100%;">
+            <option value="1">1 candidate at a time</option>
+            <option value="2" selected>2 candidates at a time</option>
+            <option value="3">3 candidates at a time</option>
+            <option value="5">5 candidates at a time</option>
+          </select>
+          <small style="color: var(--text-muted); font-size: 0.78rem; display: block; margin-top: 0.35rem;">
+            Each candidate runs on an independent session and unique LangGraph thread without shared state.
+          </small>
+        </div>
+
+        <div class="form-group" style="margin-bottom: 1.25rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+            <label class="form-label" style="font-weight: 600; font-size: 0.88rem; margin: 0;">
+              Select Shortlisted Candidates (${shortlistedCandidates.length} available)
+            </label>
+            <button type="button" class="btn btn-xs" style="font-size: 0.75rem; color: var(--primary-color);" onclick="document.querySelectorAll('.batch-cand-check').forEach(cb => cb.checked = true)">
+              Select All
+            </button>
+          </div>
+          <div style="max-height: 220px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 0.5rem; background: var(--bg-surface-elevated);">
+            ${shortlistedCandidates.map((c) => `
+              <label style="display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0.6rem; border-radius: var(--radius-sm); cursor: pointer; border-bottom: 1px solid var(--border-color);">
+                <input type="checkbox" class="batch-cand-check" value="${c.application_id}" checked style="accent-color: var(--primary-color); width: 16px; height: 16px;" />
+                <div style="flex: 1;">
+                  <div style="font-weight: 600; font-size: 0.88rem; color: var(--text-primary);">${c.candidate_name || "Applicant"}</div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono);">${c.candidate_email} • ${c.job_title || "General"}</div>
+                </div>
+                <span class="badge badge-success" style="font-size: 0.7rem;">Shortlisted</span>
+              </label>
+            `).join('')}
+          </div>
+        </div>
+
+        <div id="batch-results-area" style="display: none; margin-bottom: 1.25rem;"></div>
+
+        <div id="batch-modal-footer" style="display: flex; justify-content: flex-end; gap: 0.75rem; border-top: 1px solid var(--border-color); padding-top: 1rem;">
+          <button type="button" class="btn btn-secondary" onclick="modal.close()">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btn-submit-batch" onclick="candidatesView.submitBatchInterviews()">
+            🚀 Start Batch Sessions
+          </button>
+        </div>
+      </div>
+    `);
+  },
+
+  async submitBatchInterviews() {
+    const checkEls = document.querySelectorAll('.batch-cand-check:checked');
+    const appIds = Array.from(checkEls).map(cb => cb.value);
+    const concurrencyVal = parseInt(document.getElementById('batch-concurrency-select')?.value || '2', 10);
+    const submitBtn = document.getElementById('btn-submit-batch');
+    const resultsArea = document.getElementById('batch-results-area');
+    const footer = document.getElementById('batch-modal-footer');
+
+    if (appIds.length === 0) {
+      toast.error("Please select at least one candidate for the batch.");
+      return;
+    }
+
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Initializing Sessions...";
+    }
+
+    try {
+      const resp = await api.interviews.batchStart({
+        application_ids: appIds,
+        concurrency_limit: concurrencyVal,
+        auto_start: true,
+      });
+
+      if (resultsArea) {
+        resultsArea.style.display = "block";
+        resultsArea.innerHTML = `
+          <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-md); padding: 1rem;">
+            <h4 style="color: #10B981; font-size: 0.95rem; margin-bottom: 0.5rem;">
+              ✅ ${resp.sessions_created} Independent Interview Sessions Initialized (Capacity: ${resp.concurrency_limit})
+            </h4>
+            <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
+              Each session has an isolated LangGraph thread identity:
+            </div>
+            <div style="max-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.35rem;">
+              ${resp.sessions.map(s => `
+                <div style="background: var(--bg-surface); padding: 0.35rem 0.6rem; border-radius: 4px; font-size: 0.75rem; display: flex; justify-content: space-between; align-items: center;">
+                  <span><strong>${s.candidate_name || s.candidate_email}:</strong> Session <code style="font-family: var(--font-mono);">${s.session_id.substring(0, 8)}...</code></span>
+                  <span class="badge badge-info" style="font-size: 0.65rem;">Thread: ${s.thread_id.substring(0, 8)}...</span>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      }
+
+      if (footer) {
+        footer.innerHTML = `
+          <button type="button" class="btn btn-primary" onclick="modal.close(); candidatesView.loadCandidates();">
+            Done
+          </button>
+        `;
+      }
+
+      toast.success(`Successfully initialized ${resp.sessions_created} independent interview sessions!`);
+    } catch (err) {
+      toast.error(`Batch initialization failed: ${err.message}`);
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "🚀 Start Batch Sessions";
       }
     }
   },

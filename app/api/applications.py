@@ -12,12 +12,50 @@ from app.schemas.application import (
     ApplicationResponse,
     ApplicationUpdate,
 )
+from app.schemas.decision_replay import DecisionReplayResponse
 from app.schemas.evidence import ApplicationEvidenceSummary, EvidenceResponse
+from app.schemas.hiring_autopsy import HiringAutopsyResponse
+from app.schemas.hiring_decision import (
+    HiringDecisionCreate,
+    HiringDecisionHistoryResponse,
+    HiringDecisionResponse,
+)
 from app.schemas.hr_agent import HRAgentRequest, HRAgentResponse
 from app.schemas.interview_analysis import PreInterviewAnalysis
+from app.schemas.post_hire_outcome import (
+    PostHireOutcomeCreate,
+    PostHireOutcomeListResponse,
+    PostHireOutcomeResponse,
+)
 from app.schemas.verification import VerificationCreate, VerificationResponse
 from app.services.ai_evidence import AIEvidenceServiceError
 from app.services.ai_hr_agent import HRAgentServiceError
+from app.services.decision_replay import (
+    ApplicationNotFoundError as ReplayAppNotFoundError,
+    build_decision_replay,
+)
+from app.services.hiring_autopsy import (
+    ApplicationNotFoundError as AutopsyAppNotFoundError,
+    build_hiring_autopsy,
+)
+from app.services.post_hire_outcome import (
+    ApplicationNotFoundError as OutcomeAppNotFoundError,
+    InvalidCapabilityError as OutcomeInvalidCapabilityError,
+    InvalidOutcomeStatusError,
+    PostHireOutcomeNotFoundError,
+    get_post_hire_outcome,
+    list_post_hire_outcomes,
+    record_post_hire_outcome,
+)
+from app.services.hiring_decision import (
+    ApplicationNotFoundError as DecisionAppNotFoundError,
+    InvalidDecisionError,
+    InvalidDecisionReasonError,
+    PermissionDeniedError as DecisionPermissionDeniedError,
+    get_application_hiring_decisions,
+    get_latest_application_hiring_decision,
+    record_human_hiring_decision,
+)
 from app.services.interview_pre_analysis import build_pre_interview_analysis
 from app.services.application import (
     ApplicationNotFoundError,
@@ -382,3 +420,229 @@ async def get_pre_interview_analysis_endpoint(
             detail=str(e),
         ) from e
 
+
+@router.post(
+    "/{application_id}/hiring-decision",
+    response_model=HiringDecisionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def submit_human_hiring_decision(
+    application_id: UUID,
+    body: HiringDecisionCreate,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Submits and audits an authorized human recruiter or hiring manager hiring decision.
+
+    Guarantees:
+    - Enforces tenant isolation and HR permissions.
+    - Validates human reason (min 5 non-whitespace characters).
+    - Preserves previous decision history.
+    - Associates available interview report.
+    - Updates application lifecycle state.
+    """
+    try:
+        return await record_human_hiring_decision(
+            session=session,
+            application_id=application_id,
+            user=current_user,
+            data=body,
+        )
+    except DecisionAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except (InvalidDecisionError, InvalidDecisionReasonError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except DecisionPermissionDeniedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/hiring-decisions",
+    response_model=HiringDecisionHistoryResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_human_hiring_decisions(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Retrieves full chronological decision history for an application under tenant isolation."""
+    try:
+        return await get_application_hiring_decisions(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except DecisionAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/hiring-decision",
+    response_model=HiringDecisionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_latest_human_hiring_decision(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Retrieves the latest human hiring decision for an application."""
+    try:
+        latest = await get_latest_application_hiring_decision(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+        if not latest:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No hiring decision recorded for this application yet.",
+            )
+        return latest
+    except DecisionAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/decision-replay",
+    response_model=DecisionReplayResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_decision_replay_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Reconstructs the exact evidence, screening, interview, and decision state available at decision time."""
+    try:
+        return await build_decision_replay(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ReplayAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/post-hire-outcomes",
+    response_model=PostHireOutcomeResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_post_hire_outcome_endpoint(
+    application_id: UUID,
+    body: PostHireOutcomeCreate,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Records an evidence-based work performance outcome observation for a hired candidate."""
+    try:
+        return await record_post_hire_outcome(
+            session=session,
+            application_id=application_id,
+            user=current_user,
+            data=body,
+        )
+    except OutcomeAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except (InvalidOutcomeStatusError, OutcomeInvalidCapabilityError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/post-hire-outcomes",
+    response_model=PostHireOutcomeListResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def list_post_hire_outcomes_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Retrieves all post-hire outcome observations for an application."""
+    try:
+        return await list_post_hire_outcomes(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except OutcomeAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/post-hire-outcomes/{outcome_id}",
+    response_model=PostHireOutcomeResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_post_hire_outcome_endpoint(
+    application_id: UUID,
+    outcome_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Retrieves a specific post-hire outcome observation."""
+    try:
+        return await get_post_hire_outcome(
+            session=session,
+            application_id=application_id,
+            outcome_id=outcome_id,
+            organization_id=current_user.organization_id,
+        )
+    except (OutcomeAppNotFoundError, PostHireOutcomeNotFoundError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/hiring-autopsy",
+    response_model=HiringAutopsyResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_hiring_autopsy_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Generates an evidence-grounded Hiring Autopsy and AI-assisted process improvement suggestions."""
+    try:
+        return await build_hiring_autopsy(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except AutopsyAppNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e

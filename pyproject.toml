@@ -19,6 +19,7 @@ dependencies = [
 "pydantic[email]",
 "langgraph",
 "langgraph-checkpoint-postgres",
+"openpyxl",
 ]
 
 [project.optional-dependencies]

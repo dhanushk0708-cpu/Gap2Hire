@@ -6,13 +6,16 @@ from uuid import UUID
 import jwt
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.roles import UserRole
 from app.core.security import decode_access_token
 from app.db.session import async_session_factory
+from app.models.interview import InterviewSession
 from app.models.user import User
 from app.schemas.interview_avatar import AvatarState
+from app.schemas.interview_integrity import WSIntegrityEvent, WSIntegrityEventAck
 from app.schemas.interview_voice import (
     WSCandidateAudioEvent,
 )
@@ -22,6 +25,12 @@ from app.services.interview import (
     InterviewSessionNotFoundError,
     get_tenant_interview_session,
     process_live_candidate_message,
+)
+from app.services.interview_integrity import (
+    IntegritySessionAccessDeniedError,
+    IntegritySessionNotFoundError,
+    InvalidIntegrityEventTypeError,
+    record_integrity_event,
 )
 from app.services.interview_avatar import (
     build_avatar_state_event,
@@ -52,6 +61,7 @@ ALLOWED_ROLES = {
     UserRole.COMPANY_ADMIN.value,
     UserRole.RECRUITER.value,
     UserRole.HIRING_MANAGER.value,
+    UserRole.CANDIDATE.value,
 }
 
 
@@ -99,19 +109,44 @@ async def interview_websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Forbidden")
         return
 
-    # 3. Verify tenant isolation & session state
+    # 3. Verify tenant isolation, candidate authorization & session state
     async with async_session_factory() as db_session:
-        interview_session = await get_tenant_interview_session(
-            session=db_session,
-            session_id=session_id,
-            organization_id=user.organization_id,
+        from app.models.application import Application
+        from app.models.candidate import Candidate
+        from app.models.job import Job
+
+        stmt = (
+            select(InterviewSession)
+            .join(Application, Application.id == InterviewSession.application_id)
+            .join(Job, Job.id == Application.job_id)
+            .options(
+                selectinload(InterviewSession.application).selectinload(Application.candidate),
+            )
+            .where(
+                InterviewSession.id == session_id,
+                Job.organization_id == user.organization_id,
+            )
         )
+        interview_session = await db_session.scalar(stmt)
         if interview_session is None:
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="Interview session not found",
             )
             return
+
+        # If user is a CANDIDATE, verify they own this session
+        if user.role == UserRole.CANDIDATE.value:
+            if (
+                not interview_session.application
+                or not interview_session.application.candidate
+                or interview_session.application.candidate.email.strip().lower() != user.email.strip().lower()
+            ):
+                await websocket.close(
+                    code=status.WS_1008_POLICY_VIOLATION,
+                    reason="Candidate is not authorized for this interview session",
+                )
+                return
 
         if interview_session.status != "IN_PROGRESS":
             await websocket.close(
@@ -488,7 +523,64 @@ async def interview_websocket_endpoint(
                 )
 
             # -------------------------------------------------------------
-            # C. Unsupported Event Type
+            # C. Client Integrity Signal: Observable Session Events
+            # -------------------------------------------------------------
+            elif event_type == "integrity_event":
+                try:
+                    integrity_event_payload = WSIntegrityEvent.model_validate(data)
+                except Exception as exc:
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "system",
+                            "event": "error",
+                            "content": f"Malformed integrity event: {exc}",
+                        },
+                    )
+                    continue
+
+                try:
+                    async with async_session_factory() as db_session:
+                        recorded_event = await record_integrity_event(
+                            session=db_session,
+                            session_id=session_id,
+                            event_type=integrity_event_payload.event_type,
+                            user=user,
+                            occurred_at=integrity_event_payload.occurred_at,
+                            metadata=integrity_event_payload.metadata,
+                        )
+
+                    ack_event = WSIntegrityEventAck(
+                        event_type=integrity_event_payload.event_type,
+                        event_id=str(recorded_event.id),
+                        occurred_at=recorded_event.occurred_at.isoformat(),
+                    )
+                    await connection_manager.send_json(
+                        session_id,
+                        ack_event.model_dump(),
+                    )
+                except (IntegritySessionNotFoundError, IntegritySessionAccessDeniedError, InvalidIntegrityEventTypeError, ValueError) as exc:
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "system",
+                            "event": "error",
+                            "content": str(exc),
+                        },
+                    )
+                except Exception as exc:
+                    logger.error(f"Unexpected error recording integrity event for session {session_id}: {exc}")
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "system",
+                            "event": "error",
+                            "content": "An internal error occurred persisting the integrity event.",
+                        },
+                    )
+
+            # -------------------------------------------------------------
+            # D. Unsupported Event Type
             # -------------------------------------------------------------
             else:
                 await connection_manager.send_json(

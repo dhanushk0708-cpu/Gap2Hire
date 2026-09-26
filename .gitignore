@@ -3,7 +3,12 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
-
+echo uploads/>>.gitignore
+echo .pytest_cache/>>.gitignore
+echo __pycache__/>>.gitignore
 credentials/
 *.json
 credentials/google-oauth.json
+
+echo scratch/>>.gitignore
+echo scratch_*.py>>.gitignore

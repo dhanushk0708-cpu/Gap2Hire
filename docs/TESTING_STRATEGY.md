@@ -21,21 +21,27 @@ Examples:
 
 Test FastAPI endpoints including:
 
-* Authentication
-* Jobs
-* Applications
-* Evidence
-* Verification
-* Hiring decisions
+* Authentication & RBAC
+* Jobs & Capability Blueprints
+* Applications & Screening
+* Interview Sessions & Real-time WebSockets
+* Post-Interview Evidence Reports
+* Human Hiring Decisions
+* Decision Replay
+* Post-Hire Outcomes
+* Hiring Autopsy & AI Advisory Suggestions
 
 ### Integration Tests
 
 Test interactions between important components such as:
 
-* API + PostgreSQL
+* API + PostgreSQL + Alembic Migrations
 * API + Redis
+* LangGraph state checkpointing & concurrent interview sessions
 * Resume processing + evidence analysis
-* AI services + application workflow
+* Decision Replay historical reconstruction
+* Post-Hire Outcomes controlled states
+* Hiring Autopsy evidence comparison + AI process improvement suggestions
 
 ## 3. Security Testing
 

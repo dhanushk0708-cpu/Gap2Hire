@@ -18,17 +18,21 @@ AI will support:
 * Gap and uncertainty identification
 * Verification recommendations
 
-## 3. Future AI Capabilities
+## 3. Implemented AI Capabilities (MVP Complete)
 
-As Gap2Hire evolves, AI will support:
+* Job description analysis & Capability extraction
+* Candidate resume extraction & Evidence research
+* Evidence strength classification & Gap identification
+* AI Screening & Candidate Top-N Shortlisting
+* LangGraph-powered Adaptive Live AI Interviews & Integrity Signal Detection
+* Post-Interview Evidence Report Synthesis
+* Hiring Autopsy & AI Process Improvement Advisory Layer
 
-* Adaptive interviews
-* Company knowledge through RAG
-* Personalized training
-* Post-hire analysis
-* Decision replay
-* Hiring autopsy
-* Candidate rediscovery
+## 3.1 Post-MVP AI Capabilities (Future Scope)
+
+* Candidate Rediscovery matching
+* Cross-cycle aggregate organizational hiring intelligence
+* Dynamic personalized employee curriculum generation
 
 ## 4. AI Processing Flow
 

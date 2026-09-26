@@ -17,6 +17,9 @@ from app.api.jd_analysis import router as jd_analysis_router
 from app.api.jobs import router as jobs_router
 from app.api.research_state import router as research_state_router
 from app.api.demo import router as demo_router
+from app.api.interview_datasets import router as interview_datasets_router
+from app.api.interview_plans import router as interview_plans_router
+from app.api.interview_schedules import router as interview_schedules_router
 from app.api.screening import router as screening_router
 from app.api.verifications import router as verifications_router
 from app.core.config import settings
@@ -48,11 +51,14 @@ app.include_router(research_state_router)
 app.include_router(verifications_router)
 app.include_router(interview_rounds_router)
 app.include_router(interviews_router)
+app.include_router(interview_schedules_router)
 app.include_router(interview_ws_router)
 app.include_router(email_connections_router)
 app.include_router(email_router)
 app.include_router(screening_router)
 app.include_router(demo_router)
+app.include_router(interview_datasets_router)
+app.include_router(interview_plans_router)
 
 
 

@@ -89,14 +89,17 @@ The system shall follow these principles:
 * The system shall use permitted hiring evidence and identified gaps to support personalized training.
 * Training progress and newly generated skill evidence may be recorded.
 
-## 2.8 Post-Hire & Process Learning
+## 2.8 Post-Hire & Process Learning (MVP Complete)
 
-* The system shall support recording permitted post-hire outcomes.
-* The system shall support replaying previous hiring decisions using available evidence.
-* The system shall analyze hiring processes to identify improvement opportunities.
-* The system shall support rediscovering suitable previous candidates for new roles.
+* **Decision Replay:** The system reconstructs the complete historical hiring context at the moment of decision (screening snapshot, candidate evidence with provenance, interview report findings, unresolved areas, decision audit trail, and explicit architectural limitation disclosures).
+* **Post-Hire Outcomes:** Authorized managers record structured work observations against expected job capabilities across designated evaluation periods (30-day, 60-day, 90-day, probation) using controlled outcome states (`MEETS_EXPECTATION`, `PARTIALLY_MEETS_EXPECTATION`, `NEEDS_DEVELOPMENT`, `INSUFFICIENT_OBSERVATION`) without automated surveillance or scoring.
+* **Hiring Autopsy & Advisory Suggestions:** The system compares pre-hire evidence vs live interview findings vs post-hire work outcomes to produce neutral, evidence-grounded findings and advisory process improvements (`ADD_VERIFICATION_STEP`, `EXPAND_INTERVIEW_QUESTIONS`, `UPDATE_CAPABILITY_BLUEPRINT`, `REFINE_SCREENING_CRITERIA`). Suggestions are non-blaming and strictly advisory (`is_advisory_only: true`).
 
-## 2.9 Auditability
+## 2.9 Post-MVP Capabilities (Future Scope)
+
+* Candidate Rediscovery across historical talent pools
+* Multi-cycle aggregate organization analytics
+* Automated personalized employee training track generation
 
 * Important hiring, verification, AI-analysis, and administrative actions shall be recorded.
 * Changes to important records shall be traceable where required.

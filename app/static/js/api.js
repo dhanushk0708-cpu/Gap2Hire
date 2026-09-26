@@ -205,6 +205,49 @@ const api = {
     },
   },
 
+  // Interview Dataset Management APIs
+  interviewDatasets: {
+    upload(file, jobId = null) {
+      const formData = new FormData();
+      formData.append("file", file);
+      if (jobId) {
+        formData.append("job_id", jobId);
+      }
+      return api.postForm("/interview-datasets/upload", formData);
+    },
+    list(jobId = null) {
+      const url = jobId ? `/interview-datasets?job_id=${jobId}` : "/interview-datasets";
+      return api.get(url);
+    },
+    get(fileId) {
+      return api.get(`/interview-datasets/${fileId}`);
+    },
+  },
+
+  // Interview Plans & Pre-Analysis APIs
+  interviewPlans: {
+    getPreAnalysis(applicationId) {
+      return api.get(`/applications/${applicationId}/interview/rich-pre-analysis`);
+    },
+    generatePlan(applicationId, datasetFileId = null) {
+      return api.post(`/applications/${applicationId}/interview/plans`, {
+        dataset_file_id: datasetFileId,
+      });
+    },
+    listPlans(applicationId) {
+      return api.get(`/applications/${applicationId}/interview/plans`);
+    },
+    getPlan(planId) {
+      return api.get(`/interview-plans/${planId}`);
+    },
+    updatePlan(planId, data) {
+      return api.put(`/interview-plans/${planId}`, data);
+    },
+    approvePlan(planId, notes = null) {
+      return api.post(`/interview-plans/${planId}/approve`, { notes });
+    },
+  },
+
   // Interview Setup & Rounds APIs
   interviewSetup: {
     listRounds(jobId) {
@@ -235,11 +278,23 @@ const api = {
     startSession(sessionId) {
       return api.patch(`/interviews/${sessionId}/start`);
     },
+    batchStart(payload) {
+      return api.post(`/interviews/batch-start`, payload);
+    },
     getHrLiveSnapshot(sessionId) {
       return api.get(`/interviews/${sessionId}/hr-live`);
     },
+    getRoom(sessionId) {
+      return api.get(`/interviews/${sessionId}/room`);
+    },
+    getIntegrityEvents(sessionId) {
+      return api.get(`/interviews/${sessionId}/integrity-events`);
+    },
     getReport(sessionId) {
       return api.get(`/interviews/${sessionId}/report`);
+    },
+    generateReport(sessionId) {
+      return api.post(`/interviews/${sessionId}/report`);
     },
     generateNextQuestion(sessionId) {
       return api.post(`/interviews/${sessionId}/questions`);
@@ -254,6 +309,62 @@ const api = {
       return api.patch(`/applications/${applicationId}`, {
         status,
       });
+    },
+  },
+
+  // Interview Scheduling APIs
+  interviewSchedules: {
+    scheduleInterview(sessionId, payload) {
+      return api.post(`/interviews/${sessionId}/schedule`, payload);
+    },
+    scheduleApplication(applicationId, payload) {
+      return api.post(`/applications/${applicationId}/schedule`, payload);
+    },
+    getSchedule(sessionId) {
+      return api.get(`/interviews/${sessionId}/schedule`);
+    },
+  },
+
+  // Human Hiring Decisions
+  hiringDecisions: {
+    submitDecision(applicationId, decision, decisionReason) {
+      return api.post(`/applications/${applicationId}/hiring-decision`, {
+        decision,
+        decision_reason: decisionReason,
+      });
+    },
+    getHistory(applicationId) {
+      return api.get(`/applications/${applicationId}/hiring-decisions`);
+    },
+    getLatest(applicationId) {
+      return api.get(`/applications/${applicationId}/hiring-decision`);
+    },
+  },
+
+  // Decision Replay APIs
+  decisionReplay: {
+    getReplay(applicationId) {
+      return api.get(`/applications/${applicationId}/decision-replay`);
+    },
+  },
+
+  // Post-Hire Outcomes APIs
+  postHireOutcomes: {
+    createOutcome(applicationId, payload) {
+      return api.post(`/applications/${applicationId}/post-hire-outcomes`, payload);
+    },
+    listOutcomes(applicationId) {
+      return api.get(`/applications/${applicationId}/post-hire-outcomes`);
+    },
+    getOutcome(applicationId, outcomeId) {
+      return api.get(`/applications/${applicationId}/post-hire-outcomes/${outcomeId}`);
+    },
+  },
+
+  // Hiring Autopsy APIs
+  hiringAutopsy: {
+    getAutopsy(applicationId) {
+      return api.get(`/applications/${applicationId}/hiring-autopsy`);
     },
   },
 

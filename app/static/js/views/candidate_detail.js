@@ -52,21 +52,30 @@ const candidateDetailView = {
               </button>
             </div>
             <button id="btn-goto-interview" class="btn btn-primary btn-sm" style="display: none; background: #2563EB; font-weight: 600;" onclick="candidateDetailView.startInterviewFlow()">
-              <span>🎯</span> Interview Flow →
+              <span>📋</span> Prepare Interview →
             </button>
           </div>
         </div>
 
         <!-- Tab Navigation (Clean B2B SaaS Style) -->
-        <div style="display: flex; gap: 0.5rem; background: #E2E8F0; padding: 4px; border-radius: 8px; width: fit-content; margin-bottom: 1.5rem;">
-          <button class="cand-tab-btn active" id="tab-screening" onclick="candidateDetailView.switchTab('screening')" style="padding: 0.45rem 1rem; font-size: 0.875rem; font-weight: 600; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: #FFFFFF; color: #0F172A; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
+        <div style="display: flex; gap: 0.35rem; background: #E2E8F0; padding: 4px; border-radius: 8px; width: fit-content; margin-bottom: 1.5rem; flex-wrap: wrap;">
+          <button class="cand-tab-btn active" id="tab-screening" onclick="candidateDetailView.switchTab('screening')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 600; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: #FFFFFF; color: #0F172A; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
             📋 Screening Analysis
           </button>
-          <button class="cand-tab-btn" id="tab-evidence" onclick="candidateDetailView.switchTab('evidence')" style="padding: 0.45rem 1rem; font-size: 0.875rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
+          <button class="cand-tab-btn" id="tab-evidence" onclick="candidateDetailView.switchTab('evidence')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
             🧩 Capability Evidence
           </button>
-          <button class="cand-tab-btn" id="tab-resume" onclick="candidateDetailView.switchTab('resume')" style="padding: 0.45rem 1rem; font-size: 0.875rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
-            📄 Extracted Resume
+          <button class="cand-tab-btn" id="tab-resume" onclick="candidateDetailView.switchTab('resume')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
+            📄 Resume
+          </button>
+          <button class="cand-tab-btn" id="tab-replay" onclick="candidateDetailView.switchTab('replay')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
+            ⏪ Decision Replay
+          </button>
+          <button class="cand-tab-btn" id="tab-outcomes" onclick="candidateDetailView.switchTab('outcomes')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
+            📊 Post-Hire Outcomes
+          </button>
+          <button class="cand-tab-btn" id="tab-autopsy" onclick="candidateDetailView.switchTab('autopsy')" style="padding: 0.45rem 0.85rem; font-size: 0.825rem; font-weight: 500; border-radius: 6px; border: none; cursor: pointer; transition: all 0.15s ease; background: transparent; color: #475569;">
+            🔬 Hiring Autopsy
           </button>
         </div>
 
@@ -180,6 +189,12 @@ const candidateDetailView = {
       this.renderEvidenceTab(container);
     } else if (this.activeTab === "resume") {
       this.renderResumeTab(container);
+    } else if (this.activeTab === "replay") {
+      this.renderDecisionReplayTab(container);
+    } else if (this.activeTab === "outcomes") {
+      this.renderPostHireOutcomesTab(container);
+    } else if (this.activeTab === "autopsy") {
+      this.renderHiringAutopsyTab(container);
     }
   },
 
@@ -576,7 +591,337 @@ ${resumeText}
     `;
   },
 
-  async runScreening() {
+  async renderDecisionReplayTab(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 2rem; color: #64748B;">Reconstructing decision state snapshot...</div>`;
+    try {
+      const replay = await api.decisionReplay.getReplay(this.currentAppId);
+      const dec = replay.decision_context;
+      const iv = replay.interview_context;
+
+      container.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 1.25rem;">
+          <!-- Card 1: Decision Snapshot -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.75rem;">
+              <div>
+                <span style="font-size: 0.75rem; font-weight: 700; color: #4338CA; background: #EEF2FF; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;">
+                  Historical Audit Replay
+                </span>
+                <h3 style="font-size: 1.2rem; font-weight: 700; color: #0F172A; margin: 0.35rem 0 0 0;">
+                  Decision Context at Timestamp
+                </h3>
+              </div>
+              <span class="badge ${dec.decision === 'SELECTED' ? 'badge-success' : dec.decision === 'REJECTED' ? 'badge-danger' : 'badge-warning'}" style="font-size: 0.85rem; padding: 6px 14px;">
+                DECISION: ${dec.decision}
+              </span>
+            </div>
+
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; font-size: 0.85rem;">
+              <div><strong>Decision Maker:</strong> ${dec.decided_by_name}</div>
+              <div><strong>Decided At:</strong> ${new Date(dec.decided_at).toLocaleString()}</div>
+              <div><strong>Job:</strong> ${dec.job_title}</div>
+              <div><strong>Status:</strong> ${dec.application_status}</div>
+            </div>
+
+            <div style="background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px; padding: 1rem; font-size: 0.875rem; line-height: 1.5;">
+              <strong style="color: #334155;">Human Decision Rationale:</strong>
+              <div style="color: #0F172A; margin-top: 0.25rem;">"${dec.decision_reason}"</div>
+            </div>
+          </div>
+
+          <!-- Card 2: Knowledge State Available at Decision Time -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <h4 style="font-size: 1rem; font-weight: 700; color: #0F172A; margin: 0 0 1rem 0;">
+              Evidence State Available During Evaluation
+            </h4>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem;">
+              <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem;">
+                <div style="font-size: 0.8rem; font-weight: 700; color: #059669; text-transform: uppercase; margin-bottom: 0.5rem;">
+                  Demonstrated in Interview (${iv?.demonstrated_capabilities?.length || 0})
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 0.35rem;">
+                  ${(iv?.demonstrated_capabilities || []).map(c => `<span class="badge badge-success" style="font-size: 0.75rem;">${c}</span>`).join('') || '<span style="color: #94A3B8; font-size: 0.8rem;">None</span>'}
+                </div>
+              </div>
+
+              <div style="background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; padding: 1rem;">
+                <div style="font-size: 0.8rem; font-weight: 700; color: #D97706; text-transform: uppercase; margin-bottom: 0.5rem;">
+                  Unknown / Unverified at Decision (${iv?.unknown_capabilities?.length || 0})
+                </div>
+                <div style="display: flex; flex-wrap: wrap; gap: 0.35rem;">
+                  ${(iv?.unknown_capabilities || []).map(c => `<span class="badge badge-warning" style="font-size: 0.75rem;">${c}</span>`).join('') || '<span style="color: #94A3B8; font-size: 0.8rem;">None</span>'}
+                </div>
+              </div>
+            </div>
+
+            <!-- Decision History Chain -->
+            <h4 style="font-size: 0.9rem; font-weight: 700; color: #0F172A; margin: 1.25rem 0 0.5rem 0;">
+              Audit History Chain (${replay.decision_history?.length || 0})
+            </h4>
+            <div style="display: flex; flex-direction: column; gap: 0.5rem;">
+              ${(replay.decision_history || []).map((h, i) => `
+                <div style="padding: 0.65rem 0.85rem; background: #F8FAFC; border-radius: 6px; border-left: 3px solid #6366F1; font-size: 0.8rem; display: flex; justify-content: space-between; align-items: center;">
+                  <div><strong>${h.decision}</strong> by ${h.decided_by}: "${h.decision_reason}"</div>
+                  <span style="color: #64748B;">${new Date(h.decided_at).toLocaleString()}</span>
+                </div>
+              `).join('')}
+            </div>
+
+            <!-- Limitations -->
+            <div style="margin-top: 1.25rem; padding: 0.75rem; background: #F1F5F9; border-radius: 6px; font-size: 0.75rem; color: #64748B; line-height: 1.4;">
+              <strong>Architectural Fidelity Note:</strong> ${(replay.limitations || []).join(' ')}
+            </div>
+          </div>
+        </div>
+      `;
+    } catch (err) {
+      container.innerHTML = `<div style="color: #EF4444; padding: 2rem; text-align: center;">Failed to load Decision Replay: ${err.message}</div>`;
+    }
+  },
+
+  async renderPostHireOutcomesTab(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 2rem; color: #64748B;">Loading post-hire outcomes...</div>`;
+    try {
+      const resp = await api.postHireOutcomes.listOutcomes(this.currentAppId);
+      const outcomes = resp.outcomes || [];
+
+      container.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 1.25rem;">
+          <!-- Record New Outcome Card -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+              <div>
+                <h3 style="font-size: 1.15rem; font-weight: 700; color: #0F172A; margin: 0;">
+                  Record Post-Hire Work Outcome Observation
+                </h3>
+                <p style="font-size: 0.8rem; color: #64748B; margin: 0.2rem 0 0 0;">
+                  Structured feedback comparing expected capability vs actual on-the-job execution.
+                </p>
+              </div>
+              <span style="background: #ECFDF5; color: #065F46; border: 1px solid #A7F3D0; font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 6px;">
+                Organizational Learning
+              </span>
+            </div>
+
+            <form id="form-new-outcome" onsubmit="candidateDetailView.submitNewOutcome(event)" style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+              <div>
+                <label style="display: block; font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem;">Capability Name *</label>
+                <input type="text" id="out-cap-name" required placeholder="e.g. Redis Distributed Caching" style="width: 100%; border: 1px solid #CBD5E1; border-radius: 6px; padding: 0.5rem; font-size: 0.85rem;" />
+              </div>
+
+              <div>
+                <label style="display: block; font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem;">Observation Window *</label>
+                <select id="out-period" style="width: 100%; border: 1px solid #CBD5E1; border-radius: 6px; padding: 0.5rem; font-size: 0.85rem; background: #FFF;">
+                  <option value="90_DAYS">90 Days</option>
+                  <option value="60_DAYS">60 Days</option>
+                  <option value="30_DAYS">30 Days</option>
+                  <option value="PROBATION">Probation Period</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="display: block; font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem;">Outcome Status *</label>
+                <select id="out-status" style="width: 100%; border: 1px solid #CBD5E1; border-radius: 6px; padding: 0.5rem; font-size: 0.85rem; background: #FFF;">
+                  <option value="MEETS_EXPECTATION">✅ Meets Expectation</option>
+                  <option value="PARTIALLY_MEETS_EXPECTATION">⚠️ Partially Meets Expectation</option>
+                  <option value="NEEDS_DEVELOPMENT">🔧 Needs Development</option>
+                  <option value="INSUFFICIENT_OBSERVATION">❓ Insufficient Observation</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="display: block; font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem;">Evidence / Artifact Reference</label>
+                <input type="text" id="out-ref" placeholder="e.g. PR #1042 / Architecture RFC" style="width: 100%; border: 1px solid #CBD5E1; border-radius: 6px; padding: 0.5rem; font-size: 0.85rem;" />
+              </div>
+
+              <div style="grid-column: span 2;">
+                <label style="display: block; font-size: 0.8rem; font-weight: 600; color: #334155; margin-bottom: 0.35rem;">Observed Outcome Description *</label>
+                <textarea id="out-desc" required rows="2" placeholder="Factual observation: e.g. Candidate successfully configured cluster Redis failover but required guidance on distributed lock ttl." style="width: 100%; border: 1px solid #CBD5E1; border-radius: 6px; padding: 0.5rem; font-size: 0.85rem;"></textarea>
+              </div>
+
+              <div style="grid-column: span 2; display: flex; justify-content: flex-end;">
+                <button type="submit" class="btn btn-primary btn-sm" style="background: #2563EB; font-weight: 600; padding: 0.5rem 1.25rem;">
+                  Save Work Outcome Observation
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Existing Outcomes List -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <h4 style="font-size: 1rem; font-weight: 700; color: #0F172A; margin: 0 0 1rem 0;">
+              Recorded Post-Hire Outcomes (${outcomes.length})
+            </h4>
+
+            ${outcomes.length === 0 ? `
+              <div style="text-align: center; color: #94A3B8; padding: 1.5rem 0; font-style: italic;">
+                No post-hire outcomes recorded yet. Use the form above to record 30/60/90-day observations.
+              </div>
+            ` : `
+              <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                ${outcomes.map(o => {
+                  const badgeClass = o.outcome_status === 'MEETS_EXPECTATION' ? 'badge-success' : o.outcome_status === 'NEEDS_DEVELOPMENT' ? 'badge-danger' : 'badge-warning';
+                  return `
+                    <div style="padding: 1rem; background: #F8FAFC; border-radius: 8px; border-left: 3px solid #2563EB; display: flex; flex-direction: column; gap: 0.4rem;">
+                      <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                        <div style="display: flex; align-items: center; gap: 0.5rem;">
+                          <span style="font-weight: 700; color: #0F172A; font-size: 0.95rem;">${o.capability_name}</span>
+                          <span class="badge ${badgeClass}" style="font-size: 0.75rem;">${o.outcome_status}</span>
+                          <span style="font-size: 0.75rem; color: #64748B; background: #E2E8F0; padding: 2px 6px; border-radius: 4px;">${o.outcome_period}</span>
+                        </div>
+                        <span style="font-size: 0.75rem; color: #64748B;">Recorded by ${o.recorded_by_name} • ${new Date(o.recorded_at).toLocaleDateString()}</span>
+                      </div>
+                      <div style="font-size: 0.85rem; color: #334155; line-height: 1.4;">"${o.observed_outcome_description}"</div>
+                      ${o.evidence_reference ? `<div style="font-size: 0.75rem; color: #2563EB;">🔗 Reference: ${o.evidence_reference}</div>` : ''}
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            `}
+          </div>
+        </div>
+      `;
+    } catch (err) {
+      container.innerHTML = `<div style="color: #EF4444; padding: 2rem; text-align: center;">Failed to load outcomes: ${err.message}</div>`;
+    }
+  },
+
+  async submitNewOutcome(event) {
+    event.preventDefault();
+    const capName = document.getElementById("out-cap-name")?.value;
+    const period = document.getElementById("out-period")?.value;
+    const outStatus = document.getElementById("out-status")?.value;
+    const desc = document.getElementById("out-desc")?.value;
+    const ref = document.getElementById("out-ref")?.value;
+
+    try {
+      await api.postHireOutcomes.createOutcome(this.currentAppId, {
+        capability_name: capName,
+        outcome_period: period,
+        outcome_status: outStatus,
+        observed_outcome_description: desc,
+        evidence_reference: ref || null,
+      });
+      toast.success("Post-hire outcome recorded successfully!");
+      const container = document.getElementById("tab-content-container");
+      if (container) this.renderPostHireOutcomesTab(container);
+    } catch (err) {
+      toast.error(`Failed to record outcome: ${err.message}`);
+    }
+  },
+
+  async renderHiringAutopsyTab(container) {
+    container.innerHTML = `<div style="text-align: center; padding: 2rem; color: #64748B;">Running Hiring Autopsy analysis...</div>`;
+    try {
+      const autopsy = await api.hiringAutopsy.getAutopsy(this.currentAppId);
+
+      container.innerHTML = `
+        <div style="display: flex; flex-direction: column; gap: 1.25rem;">
+          <!-- Header Banner -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 0.75rem;">
+              <div>
+                <span style="font-size: 0.75rem; font-weight: 700; color: #047857; background: #ECFDF5; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;">
+                  Continuous Process Improvement
+                </span>
+                <h3 style="font-size: 1.25rem; font-weight: 700; color: #0F172A; margin: 0.35rem 0 0.2rem 0;">
+                  Hiring Autopsy & Learning Analysis
+                </h3>
+                <p style="font-size: 0.825rem; color: #64748B; margin: 0;">
+                  Compares Expected Capabilities vs What Was Known During Hiring vs Observed Work Execution.
+                </p>
+              </div>
+              <div style="font-size: 0.8rem; color: #334155; text-align: right;">
+                <strong>Role:</strong> ${autopsy.job_title}<br />
+                <span style="color: #64748B;">Evaluated Capabilities: ${autopsy.capability_comparison?.length || 0}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Section 1: Facts & Observed Data Matrix -->
+          <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 10px; padding: 1.5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.02);">
+            <h4 style="font-size: 1rem; font-weight: 700; color: #0F172A; margin: 0 0 0.5rem 0;">
+              📊 Facts & Observed Data Matrix
+            </h4>
+            <p style="font-size: 0.8rem; color: #64748B; margin: 0 0 1rem 0;">
+              Objective side-by-side comparison across all hiring pipeline stages.
+            </p>
+
+            <div style="overflow-x: auto;">
+              <table style="width: 100%; border-collapse: collapse; font-size: 0.825rem; text-align: left;">
+                <thead>
+                  <tr style="background: #F8FAFC; border-bottom: 2px solid #E2E8F0; color: #475569;">
+                    <th style="padding: 0.65rem 0.75rem;">Capability</th>
+                    <th style="padding: 0.65rem 0.75rem;">Pre-Hire Evidence</th>
+                    <th style="padding: 0.65rem 0.75rem;">Interview Evaluation</th>
+                    <th style="padding: 0.65rem 0.75rem;">Post-Hire Outcome</th>
+                    <th style="padding: 0.65rem 0.75rem;">Grounded Observation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${(autopsy.capability_comparison || []).map(c => {
+                    const postBadge = c.post_hire_outcome_status === 'MEETS_EXPECTATION' ? 'badge-success' : c.post_hire_outcome_status === 'NEEDS_DEVELOPMENT' ? 'badge-danger' : 'badge-warning';
+                    return `
+                      <tr style="border-bottom: 1px solid #F1F5F9;">
+                        <td style="padding: 0.75rem; font-weight: 600; color: #0F172A;">${c.capability_name}</td>
+                        <td style="padding: 0.75rem;"><span class="badge ${c.pre_hire_evidence_state === 'DEMONSTRATED' ? 'badge-success' : 'badge-warning'}" style="font-size: 0.72rem;">${c.pre_hire_evidence_state}</span></td>
+                        <td style="padding: 0.75rem;"><span class="badge ${c.interview_demonstration_state === 'DEMONSTRATED_STRONG' ? 'badge-success' : 'badge-primary'}" style="font-size: 0.72rem;">${c.interview_demonstration_state}</span></td>
+                        <td style="padding: 0.75rem;"><span class="badge ${postBadge}" style="font-size: 0.72rem;">${c.post_hire_outcome_status}</span></td>
+                        <td style="padding: 0.75rem; color: #475569; line-height: 1.35;">${c.outcome_delta_observation}</td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Section 2: AI Process Improvement Suggestions -->
+          <div style="background: #FFFFFF; border: 2px solid #3B82F6; border-radius: 10px; padding: 1.5rem; box-shadow: 0 2px 4px rgba(59,130,246,0.06);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+              <h4 style="font-size: 1rem; font-weight: 700; color: #1E3A8A; margin: 0; display: flex; align-items: center; gap: 0.5rem;">
+                <span>💡</span> AI Process Improvement Suggestions
+              </h4>
+              <span style="font-size: 0.72rem; font-weight: 700; color: #2563EB; background: #DBEAFE; padding: 2px 8px; border-radius: 4px;">
+                Advisory Only • Non-Automated
+              </span>
+            </div>
+            <p style="font-size: 0.8rem; color: #64748B; margin: 0 0 1rem 0;">
+              Evidence-grounded suggestions to improve future interview rubrics and screening blueprints.
+            </p>
+
+            <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+              ${(autopsy.ai_improvement_suggestions || []).map(s => `
+                <div style="padding: 1rem; background: #F8FAFC; border: 1px solid #BFDBFE; border-radius: 8px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.35rem; flex-wrap: wrap; gap: 0.5rem;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem;">
+                      <span class="badge badge-primary" style="font-size: 0.75rem; font-weight: 700;">${s.action_type}</span>
+                      <strong style="color: #0F172A; font-size: 0.9rem;">${s.affected_capability}</strong>
+                    </div>
+                    <span style="font-size: 0.72rem; color: #059669; font-weight: 600;">${s.confidence_strength}</span>
+                  </div>
+                  <div style="font-size: 0.85rem; color: #1E293B; line-height: 1.4; margin-bottom: 0.4rem;">
+                    <strong>Recommendation:</strong> ${s.suggested_improvement}
+                  </div>
+                  <div style="font-size: 0.75rem; color: #64748B;">
+                    <strong>Observed Pattern:</strong> ${s.observed_pattern}
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+
+            <!-- Autopsy Limitations Statement -->
+            <div style="margin-top: 1rem; padding: 0.65rem 0.85rem; background: #EFF6FF; border-radius: 6px; font-size: 0.75rem; color: #1E40AF; line-height: 1.35;">
+              <strong>Principle:</strong> ${(autopsy.limitations || []).join(' ')}
+            </div>
+          </div>
+        </div>
+      `;
+    } catch (err) {
+      container.innerHTML = `<div style="color: #EF4444; padding: 2rem; text-align: center;">Failed to generate Hiring Autopsy: ${err.message}</div>`;
+    }
+  },
     try {
       toast.info("Executing automated screening evaluation...");
       const res = await api.screening.runScreening(this.currentAppId);
@@ -607,7 +952,7 @@ ${resumeText}
       (this.screeningReport && this.screeningReport.job_id) ||
       (window.appState && window.appState.activeJobId) ||
       "";
-    router.navigate("interview-live", { applicationId: this.currentAppId, jobId });
+    router.navigate("interview-setup", { applicationId: this.currentAppId, jobId });
   },
 };
 

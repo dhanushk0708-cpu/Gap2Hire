@@ -10,6 +10,8 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.application import Application
     from app.models.capability import Capability
+    from app.models.interview_integrity import InterviewIntegrityEvent
+    from app.models.interview_report import InterviewReportModel
     from app.models.interview_round import InterviewRound
 
 
@@ -75,10 +77,24 @@ class InterviewSession(Base):
         cascade="all, delete-orphan",
         order_by="InterviewQuestion.sequence_number.asc()",
     )
+    answer_analyses: Mapped[list["InterviewAnswerAnalysis"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+    )
     messages: Mapped[list["InterviewMessage"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
         order_by="InterviewMessage.sequence_number.asc()",
+    )
+    integrity_events: Mapped[list["InterviewIntegrityEvent"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="InterviewIntegrityEvent.occurred_at.asc()",
+    )
+    report: Mapped["InterviewReportModel | None"] = relationship(
+        back_populates="session",
+        uselist=False,
+        cascade="all, delete-orphan",
     )
 
 
@@ -96,10 +112,33 @@ class InterviewQuestion(Base):
         index=True,
     )
 
-    capability_id: Mapped[UUID] = mapped_column(
-        ForeignKey("capabilities.id", ondelete="CASCADE"),
-        nullable=False,
+    capability_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("capabilities.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
+    )
+
+    plan_question_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("interview_plan_questions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    parent_question_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("interview_questions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    question_type: Mapped[str] = mapped_column(
+        String(50),
+        default="PLANNED",
+        nullable=False,
+    )
+
+    concept: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
     )
 
     question: Mapped[str] = mapped_column(
@@ -131,7 +170,8 @@ class InterviewQuestion(Base):
     )
 
     session: Mapped["InterviewSession"] = relationship(back_populates="questions")
-    capability: Mapped["Capability"] = relationship()
+    capability: Mapped["Capability | None"] = relationship()
+    parent_question: Mapped["InterviewQuestion | None"] = relationship(remote_side=[id])
 
 
 class InterviewMessage(Base):
