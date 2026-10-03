@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     source_discovery_max_links: int = 50
     max_research_iterations: int = 10
 
+    # Vision Integrity & Object Detection Settings
+    vision_enabled: bool = True
+    vision_model_name: str = "yolov8n.pt"
+    vision_confidence_threshold: float = 0.45
+    vision_required_consecutive_detections: int = 2
+    vision_frame_sample_interval_ms: int = 500
+    vision_event_cooldown_seconds: int = 25
+    vision_storage_dir: str = "storage/integrity"
 
     model_config = SettingsConfigDict(
         env_file=".env",

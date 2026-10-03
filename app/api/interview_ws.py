@@ -1,18 +1,19 @@
 import base64
+from datetime import datetime
 import json
 import logging
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import jwt
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.roles import UserRole
 from app.core.security import decode_access_token
 from app.db.session import async_session_factory
-from app.models.interview import InterviewSession
+from app.models.interview import InterviewMessage, InterviewQuestion, InterviewSession
 from app.models.user import User
 from app.schemas.interview_avatar import AvatarState
 from app.schemas.interview_integrity import WSIntegrityEvent, WSIntegrityEventAck
@@ -23,6 +24,7 @@ from app.schemas.interview_ws import WSCandidateMessageEvent
 from app.services.interview import (
     InvalidSessionStateError,
     InterviewSessionNotFoundError,
+    generate_next_question_for_session,
     get_tenant_interview_session,
     process_live_candidate_message,
 )
@@ -148,25 +150,45 @@ async def interview_websocket_endpoint(
                 )
                 return
 
-        if interview_session.status != "IN_PROGRESS":
+        # Auto-start session if in CREATED or SCHEDULED state
+        if interview_session.status in ("CREATED", "SCHEDULED"):
+            interview_session.status = "IN_PROGRESS"
+            interview_session.started_at = datetime.utcnow()
+            interview_session.updated_at = datetime.utcnow()
+            msg_count_stmt = select(func.count(InterviewMessage.id)).where(InterviewMessage.session_id == session_id)
+            has_msgs = ((await db_session.scalar(msg_count_stmt)) or 0) > 0
+            if not has_msgs:
+                sys_msg = InterviewMessage(
+                    session_id=interview_session.id,
+                    role="SYSTEM",
+                    content="Interview session started.",
+                    sequence_number=1,
+                )
+                db_session.add(sys_msg)
+            await db_session.commit()
+            logger.info(f"[WS AUTO-START] Transitioned session {session_id} from {interview_session.status} to IN_PROGRESS")
+
+        elif interview_session.status != "IN_PROGRESS":
+            logger.warning(f"[WS STATUS REJECT] Session {session_id} in status '{interview_session.status}'")
             await websocket.close(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason=f"Interview session is in '{interview_session.status}' status",
             )
             return
 
-    # 4. Connection Manager (reject duplicate connection per session)
-    try:
-        await connection_manager.connect(session_id, websocket)
-    except DuplicateConnectionError:
-        logger.warning(f"Duplicate connection rejected for session {session_id}")
+    # 4. Connection Manager (supports multiple / reconnecting sockets)
+    is_candidate = (user.role == UserRole.CANDIDATE.value)
+    if is_candidate and connection_manager.has_candidate(session_id):
         await websocket.close(
             code=status.WS_1008_POLICY_VIOLATION,
-            reason="Another active connection exists for this session",
+            reason="Candidate connection already active for this session",
         )
         return
 
-    # 5. Send initial system connection confirmation & initial IDLE avatar state
+    await connection_manager.connect(session_id, websocket, is_candidate=is_candidate)
+    logger.info(f"[WS CONNECT] session_id={session_id}, user={user.id}, role={user.role}")
+
+    # 5. Send initial system connection confirmation
     await connection_manager.send_json(
         session_id,
         {
@@ -175,12 +197,63 @@ async def interview_websocket_endpoint(
             "content": "Connected to real-time live interview session.",
         },
     )
-    await connection_manager.send_json(
-        session_id,
-        build_avatar_state_event(AvatarState.IDLE),
-    )
 
-    # 6. Message Loop
+    # 6. Immediately verify or generate the active interview question
+    async with async_session_factory() as db_session:
+        q_stmt = (
+            select(InterviewQuestion)
+            .where(InterviewQuestion.session_id == session_id)
+            .order_by(InterviewQuestion.sequence_number.desc())
+        )
+        existing_q = await db_session.scalar(q_stmt)
+
+        current_question_text = None
+        target_cap_name = "General"
+
+        if isinstance(existing_q, InterviewQuestion):
+            current_question_text = existing_q.question
+            target_cap_name = existing_q.concept or "General"
+            logger.info(f"[WS QUESTION RESUMED] session_id={session_id}, seq={existing_q.sequence_number}")
+        else:
+            try:
+                new_q = await generate_next_question_for_session(
+                    session=db_session,
+                    session_id=session_id,
+                    organization_id=user.organization_id,
+                )
+                current_question_text = new_q.question
+                target_cap_name = new_q.concept or "General"
+                logger.info(f"[WS QUESTION GENERATED] session_id={session_id}, seq={new_q.sequence_number}")
+            except Exception as q_err:
+                logger.error(f"[WS QUESTION ERROR] Could not generate initial question: {q_err}", exc_info=True)
+
+        if current_question_text:
+            # Avatar transitions to SPEAKING state
+            await connection_manager.send_json(
+                session_id,
+                build_avatar_state_event(AvatarState.SPEAKING),
+            )
+            # Send AI question message
+            await connection_manager.send_json(
+                session_id,
+                {
+                    "type": "ai_message",
+                    "content": current_question_text,
+                    "target_capability": target_cap_name,
+                },
+            )
+            # Avatar transitions to LISTENING state so candidate can answer
+            await connection_manager.send_json(
+                session_id,
+                build_avatar_state_event(AvatarState.LISTENING),
+            )
+        else:
+            await connection_manager.send_json(
+                session_id,
+                build_avatar_state_event(AvatarState.IDLE),
+            )
+
+    # 7. Message Loop
     try:
         while True:
             raw_text = await websocket.receive_text()
@@ -541,13 +614,28 @@ async def interview_websocket_endpoint(
 
                 try:
                     async with async_session_factory() as db_session:
+                        metadata = dict(integrity_event_payload.metadata or {})
+                        evidence_img_b64 = data.get("evidence_image")
+                        event_id = uuid4()
+                        if evidence_img_b64:
+                            if "," in evidence_img_b64:
+                                evidence_img_b64 = evidence_img_b64.split(",", 1)[1]
+                            try:
+                                from app.services.vision_service import vision_service
+                                raw_img = base64.b64decode(evidence_img_b64)
+                                ref = await vision_service.save_evidence_frame(session_id, event_id, raw_img)
+                                metadata["evidence_reference"] = ref
+                                metadata["evidence_url"] = f"/api/v1/interviews/{session_id}/integrity-evidence/{event_id}"
+                            except Exception as save_err:
+                                logger.warning(f"Could not save client evidence frame: {save_err}")
+
                         recorded_event = await record_integrity_event(
                             session=db_session,
                             session_id=session_id,
                             event_type=integrity_event_payload.event_type,
                             user=user,
                             occurred_at=integrity_event_payload.occurred_at,
-                            metadata=integrity_event_payload.metadata,
+                            metadata=metadata,
                         )
 
                     ack_event = WSIntegrityEventAck(
@@ -559,6 +647,31 @@ async def interview_websocket_endpoint(
                         session_id,
                         ack_event.model_dump(),
                     )
+
+                    # If vision detection observation, broadcast red alert to candidate & HR observers
+                    if integrity_event_payload.event_type.value in ("PHONE_DETECTED", "MULTIPLE_PERSONS_DETECTED"):
+                        alert_msg = (
+                            "Mobile phone detected — Evidence frame captured"
+                            if integrity_event_payload.event_type.value == "PHONE_DETECTED"
+                            else "Multiple people detected — Evidence frame captured"
+                        )
+                        meta_dict = recorded_event.metadata_json or {}
+                        await connection_manager.send_json(
+                            session_id,
+                            {
+                                "type": "integrity_observation",
+                                "event_type": integrity_event_payload.event_type.value,
+                                "alert_title": "🔴 INTEGRITY OBSERVATION",
+                                "alert_message": alert_msg,
+                                "event_id": str(recorded_event.id),
+                                "evidence_reference": meta_dict.get("evidence_reference"),
+                                "evidence_url": meta_dict.get("evidence_url"),
+                                "confidence": meta_dict.get("confidence", 0.9),
+                                "occurred_at": recorded_event.occurred_at.isoformat(),
+                                "metadata": meta_dict,
+                            },
+                        )
+
                 except (IntegritySessionNotFoundError, IntegritySessionAccessDeniedError, InvalidIntegrityEventTypeError, ValueError) as exc:
                     await connection_manager.send_json(
                         session_id,
@@ -580,6 +693,25 @@ async def interview_websocket_endpoint(
                     )
 
             # -------------------------------------------------------------
+            # D. Client Sampled Camera Frame for Vision Monitoring
+            # -------------------------------------------------------------
+            elif event_type == "vision_frame":
+                image_b64 = data.get("image")
+                if image_b64:
+                    if "," in image_b64:
+                        image_b64 = image_b64.split(",", 1)[1]
+                    try:
+                        raw_bytes = base64.b64decode(image_b64)
+                        from app.services.vision_service import vision_service
+                        await vision_service.process_sampled_frame(
+                            session_id=session_id,
+                            image_bytes=raw_bytes,
+                            user=user,
+                        )
+                    except Exception as frame_err:
+                        logger.debug(f"[WS VISION FRAME ERROR] session {session_id}: {frame_err}")
+
+            # -------------------------------------------------------------
             # D. Unsupported Event Type
             # -------------------------------------------------------------
             else:
@@ -594,7 +726,16 @@ async def interview_websocket_endpoint(
                 continue
 
     except WebSocketDisconnect:
-        connection_manager.disconnect(session_id)
+        connection_manager.disconnect(session_id, websocket)
+        logger.info(f"[WS DISCONNECT] session_id={session_id}")
+    except RuntimeError as exc:
+        err_msg = str(exc).lower()
+        if "accept" in err_msg or "disconnect" in err_msg:
+            connection_manager.disconnect(session_id, websocket)
+            logger.info(f"[WS DISCONNECT (early)] session_id={session_id}")
+        else:
+            logger.error(f"[WS LOOP ERROR] WebSocket loop exception for session {session_id}: {exc}")
+            connection_manager.disconnect(session_id, websocket)
     except Exception as exc:
-        logger.error(f"WebSocket loop exception for session {session_id}: {exc}")
-        connection_manager.disconnect(session_id)
+        logger.error(f"[WS LOOP ERROR] WebSocket loop exception for session {session_id}: {exc}")
+        connection_manager.disconnect(session_id, websocket)
