@@ -264,24 +264,35 @@ class VisionService:
                 triggered_events.append(payload)
                 logger.warning(f"[VISION ALERT] Phone detected in session {session_id} (conf={phone_conf:.2f})")
 
-                # Persist evidence frame & database record
-                await self.save_evidence_frame(session_id, event_id, image_bytes)
-                integrity_event = InterviewIntegrityEvent(
-                    id=event_id,
-                    interview_session_id=session_id,
-                    event_type=IntegrityEventType.PHONE_DETECTED.value,
-                    occurred_at=datetime.now(timezone.utc),
-                    metadata_json=metadata,
-                    created_at=datetime.now(timezone.utc),
-                )
-                if db_session is not None:
-                    db_session.add(integrity_event)
-                    await db_session.commit()
-                else:
-                    from app.db.session import async_session_factory
-                    async with async_session_factory() as sess:
-                        sess.add(integrity_event)
-                        await sess.commit()
+                # Persist evidence frame & database record safely
+                evidence_saved = False
+                try:
+                    await self.save_evidence_frame(session_id, event_id, image_bytes)
+                    evidence_saved = True
+                except Exception as save_err:
+                    logger.error(f"[VISION PERSISTENCE ERROR] Failed to save evidence frame {event_id}: {save_err}")
+                    metadata["evidence_reference"] = None
+                    metadata["evidence_url"] = None
+
+                try:
+                    integrity_event = InterviewIntegrityEvent(
+                        id=event_id,
+                        interview_session_id=session_id,
+                        event_type=IntegrityEventType.PHONE_DETECTED.value,
+                        occurred_at=datetime.now(timezone.utc),
+                        metadata_json=metadata,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    if db_session is not None:
+                        db_session.add(integrity_event)
+                        await db_session.commit()
+                    else:
+                        from app.db.session import async_session_factory
+                        async with async_session_factory() as sess:
+                            sess.add(integrity_event)
+                            await sess.commit()
+                except Exception as db_err:
+                    logger.error(f"[VISION PERSISTENCE ERROR] Failed to record phone event in db {event_id}: {db_err}")
 
             # Process Multiple Persons Trigger
             if multi_person_triggered:
@@ -321,24 +332,35 @@ class VisionService:
                 triggered_events.append(payload)
                 logger.warning(f"[VISION ALERT] Multiple persons ({person_count}) detected in session {session_id}")
 
-                # Persist evidence frame & database record
-                await self.save_evidence_frame(session_id, event_id, image_bytes)
-                integrity_event = InterviewIntegrityEvent(
-                    id=event_id,
-                    interview_session_id=session_id,
-                    event_type=IntegrityEventType.MULTIPLE_PERSONS_DETECTED.value,
-                    occurred_at=datetime.now(timezone.utc),
-                    metadata_json=metadata,
-                    created_at=datetime.now(timezone.utc),
-                )
-                if db_session is not None:
-                    db_session.add(integrity_event)
-                    await db_session.commit()
-                else:
-                    from app.db.session import async_session_factory
-                    async with async_session_factory() as sess:
-                        sess.add(integrity_event)
-                        await sess.commit()
+                # Persist evidence frame & database record safely
+                evidence_saved = False
+                try:
+                    await self.save_evidence_frame(session_id, event_id, image_bytes)
+                    evidence_saved = True
+                except Exception as save_err:
+                    logger.error(f"[VISION PERSISTENCE ERROR] Failed to save evidence frame {event_id}: {save_err}")
+                    metadata["evidence_reference"] = None
+                    metadata["evidence_url"] = None
+
+                try:
+                    integrity_event = InterviewIntegrityEvent(
+                        id=event_id,
+                        interview_session_id=session_id,
+                        event_type=IntegrityEventType.MULTIPLE_PERSONS_DETECTED.value,
+                        occurred_at=datetime.now(timezone.utc),
+                        metadata_json=metadata,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    if db_session is not None:
+                        db_session.add(integrity_event)
+                        await db_session.commit()
+                    else:
+                        from app.db.session import async_session_factory
+                        async with async_session_factory() as sess:
+                            sess.add(integrity_event)
+                            await sess.commit()
+                except Exception as db_err:
+                    logger.error(f"[VISION PERSISTENCE ERROR] Failed to record multi-person event in db {event_id}: {db_err}")
 
         return triggered_events
 

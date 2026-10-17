@@ -38,6 +38,8 @@ from app.services.hiring_autopsy import (
     ApplicationNotFoundError as AutopsyAppNotFoundError,
     build_hiring_autopsy,
 )
+from app.schemas.hiring_intelligence import HiringIntelligenceResponse
+from app.services.hiring_intelligence import aggregate_hiring_intelligence
 from app.services.post_hire_outcome import (
     ApplicationNotFoundError as OutcomeAppNotFoundError,
     InvalidCapabilityError as OutcomeInvalidCapabilityError,
@@ -56,7 +58,12 @@ from app.services.hiring_decision import (
     get_latest_application_hiring_decision,
     record_human_hiring_decision,
 )
+from app.schemas.post_interview_scorecard import PostInterviewScorecard
+from app.schemas.pre_interview_scorecard import PreInterviewScorecard
+from app.services.interview import InvalidSessionStateError
 from app.services.interview_pre_analysis import build_pre_interview_analysis
+from app.services.post_interview_scorecard import generate_post_interview_scorecard
+from app.services.pre_interview_scorecard import generate_pre_interview_scorecard
 from app.services.application import (
     ApplicationNotFoundError,
     CandidateNotFoundError,
@@ -145,6 +152,19 @@ async def get_all_applications(
         session=session,
         organization_id=current_user.organization_id,
     )
+
+
+@router.get(
+    "/hiring-intelligence",
+    response_model=HiringIntelligenceResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_hiring_intelligence(
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Aggregates hiring intelligence across all applications for the tenant."""
+    return await aggregate_hiring_intelligence(session, current_user.organization_id)
 
 
 @router.get(
@@ -417,6 +437,131 @@ async def get_pre_interview_analysis_endpoint(
     except ApplicationNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/pre-interview-scorecard",
+    response_model=PreInterviewScorecard,
+    status_code=status.HTTP_200_OK,
+)
+async def get_pre_interview_scorecard_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Retrieves the evidence-grounded Pre-Interview Analytical Scorecard for a candidate application:
+    - Evaluates capability-by-capability evidence status (SUPPORTED, PARTIAL, UNKNOWN, CONTRADICTORY).
+    - Preserves evidence provenance with direct source citations.
+    - Honors the principle: Absence of evidence is not evidence of absence.
+    - Provides targeted verification questions and transparent confidence justifications.
+    - Computes Evidence Readiness Score strictly as an evidence completeness measure.
+    """
+    try:
+        return await generate_pre_interview_scorecard(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/pre-interview-scorecard/refresh",
+    response_model=PreInterviewScorecard,
+    status_code=status.HTTP_200_OK,
+)
+async def refresh_pre_interview_scorecard_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Refreshes and re-evaluates the Pre-Interview Analytical Scorecard with latest evidence and sources.
+    """
+    try:
+        return await generate_pre_interview_scorecard(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            force_refresh=True,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/{application_id}/post-interview-scorecard",
+    response_model=PostInterviewScorecard,
+    status_code=status.HTTP_200_OK,
+)
+async def get_post_interview_scorecard_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Retrieves the evidence-grounded Post-Interview Analytical Scorecard:
+    - Compares live interview findings against original pre-interview baseline.
+    - Preserves baseline immutability.
+    - Outlines capability-by-capability changes, rationales, and Q&A citations.
+    """
+    try:
+        return await generate_post_interview_scorecard(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            force_refresh=False,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except InvalidSessionStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/{application_id}/post-interview-scorecard/refresh",
+    response_model=PostInterviewScorecard,
+    status_code=status.HTTP_200_OK,
+)
+async def refresh_post_interview_scorecard_endpoint(
+    application_id: UUID,
+    current_user: User = Depends(require_application_manager),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Re-evaluates and refreshes the post-interview scorecard while preserving the original pre-interview baseline.
+    """
+    try:
+        return await generate_post_interview_scorecard(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            force_refresh=True,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except InvalidSessionStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
         ) from e
 

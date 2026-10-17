@@ -22,6 +22,7 @@ from app.api.interview_plans import router as interview_plans_router
 from app.api.interview_schedules import router as interview_schedules_router
 from app.api.screening import router as screening_router
 from app.api.verifications import router as verifications_router
+from app.api.hiring_chat import router as hiring_chat_router
 from app.core.config import settings
 
 
@@ -59,6 +60,7 @@ app.include_router(screening_router)
 app.include_router(demo_router)
 app.include_router(interview_datasets_router)
 app.include_router(interview_plans_router)
+app.include_router(hiring_chat_router)
 
 
 

@@ -322,31 +322,46 @@ async def generate_and_persist_interview_report(
     integrity_events = interview_session.integrity_events or []
     event_counts: dict[str, int] = {}
     event_timestamps: dict[str, list[str]] = {}
+    event_evidence_refs: dict[str, list[str]] = {}
+    event_evidence_urls: dict[str, list[str]] = {}
 
     for evt in integrity_events:
         event_counts[evt.event_type] = event_counts.get(evt.event_type, 0) + 1
         ts = evt.occurred_at.isoformat() if evt.occurred_at else datetime.now(timezone.utc).isoformat()
         event_timestamps.setdefault(evt.event_type, []).append(ts)
+        meta = evt.metadata_json or {}
+        if meta.get("evidence_reference"):
+            event_evidence_refs.setdefault(evt.event_type, []).append(str(meta["evidence_reference"]))
+        if meta.get("evidence_url"):
+            event_evidence_urls.setdefault(evt.event_type, []).append(str(meta["evidence_url"]))
 
     integrity_obs_list: list[PostInterviewIntegrityObservation] = []
     for evt_type, count in event_counts.items():
-        summary_msg = f"{count} {evt_type} event(s) recorded during session."
+        if evt_type == "PHONE_DETECTED":
+            summary_msg = f"{count} mobile phone detection observation(s) recorded."
+        elif evt_type == "MULTIPLE_PERSONS_DETECTED":
+            summary_msg = f"{count} multiple people detection observation(s) recorded."
+        else:
+            summary_msg = f"{count} {evt_type} event(s) recorded during session."
+
         integrity_obs_list.append(
             PostInterviewIntegrityObservation(
                 event_type=evt_type,
                 count=count,
                 occurred_at_list=event_timestamps.get(evt_type, []),
                 summary=summary_msg,
+                evidence_references=event_evidence_refs.get(evt_type, []),
+                evidence_urls=event_evidence_urls.get(evt_type, []),
             )
         )
 
+    disclaimer = "These are automated observations and should be reviewed by a human. They are not automatic findings of misconduct."
     if integrity_obs_list:
         integ_summary_text = (
-            f"Total {len(integrity_events)} browser session event(s) recorded. "
-            "Telemetry reflects objective client state and does not classify candidate intent."
+            f"Total {len(integrity_events)} session telemetry observation(s) recorded. {disclaimer}"
         )
     else:
-        integ_summary_text = "Stable session: No browser anomalies or connection interruptions recorded."
+        integ_summary_text = f"Stable session: No browser anomalies or vision observations recorded. {disclaimer}"
 
     integrity_summary = PostInterviewIntegritySummary(
         total_events=len(integrity_events),

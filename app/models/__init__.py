@@ -22,9 +22,11 @@ from app.models.interview_integrity import InterviewIntegrityEvent
 from app.models.interview_schedule import InterviewSchedule
 from app.models.interview_report import InterviewReportModel
 from app.models.candidate_hiring_decision import CandidateHiringDecision
+from app.models.candidate_scorecard import CandidateScorecard
 from app.models.post_hire_outcome import PostHireOutcome
 from app.models.job import Job
 from app.models.organization import Organization
+from app.models.rag_embedding import RagEmbedding
 from app.models.research_capability import ResearchCapabilityState
 from app.models.research_event import ResearchEvent
 from app.models.research_session import ResearchSession
@@ -35,6 +37,7 @@ __all__ = [
     "Application",
     "Candidate",
     "CandidateHiringDecision",
+    "CandidateScorecard",
     "CandidateSource",
     "Capability",
     "EmailConnection",
@@ -58,6 +61,7 @@ __all__ = [
     "Job",
     "Organization",
     "PostHireOutcome",
+    "RagEmbedding",
     "ResearchCapabilityState",
     "ResearchEvent",
     "ResearchSession",

@@ -40,28 +40,56 @@ class RateLimiter:
 
 class InterviewConnectionManager:
     def __init__(self):
-        self.active_connections: dict[UUID, WebSocket] = {}
-        self.rate_limiter = RateLimiter(max_messages=5, window_seconds=3.0)
+        self.active_connections: dict[UUID, list[WebSocket]] = {}
+        self.candidate_connections: dict[UUID, WebSocket] = {}
+        self.rate_limiter = RateLimiter(max_messages=15, window_seconds=3.0)
 
-    async def connect(self, session_id: UUID, websocket: WebSocket):
-        if session_id in self.active_connections:
+    def has_candidate(self, session_id: UUID) -> bool:
+        return session_id in self.candidate_connections
+
+    async def connect(self, session_id: UUID, websocket: WebSocket, is_candidate: bool = False):
+        if is_candidate and session_id in self.candidate_connections:
             raise DuplicateConnectionError(
                 f"An active connection already exists for session {session_id}"
             )
         await websocket.accept()
-        self.active_connections[session_id] = websocket
-        logger.info(f"WebSocket connected for session: {session_id}")
+        if session_id not in self.active_connections:
+            self.active_connections[session_id] = []
+        if websocket not in self.active_connections[session_id]:
+            self.active_connections[session_id].append(websocket)
+        if is_candidate:
+            self.candidate_connections[session_id] = websocket
+        logger.info(f"[WS CONNECT] WebSocket connected for session: {session_id} (active: {len(self.active_connections[session_id])})")
 
-    def disconnect(self, session_id: UUID):
+    def disconnect(self, session_id: UUID, websocket: WebSocket | None = None):
+        if session_id in self.candidate_connections:
+            if not websocket or self.candidate_connections[session_id] == websocket:
+                self.candidate_connections.pop(session_id, None)
+
         if session_id in self.active_connections:
-            self.active_connections.pop(session_id, None)
-            self.rate_limiter.remove(session_id)
-            logger.info(f"WebSocket disconnected for session: {session_id}")
+            if websocket and websocket in self.active_connections[session_id]:
+                self.active_connections[session_id].remove(websocket)
+            elif not websocket:
+                self.active_connections[session_id].clear()
+
+            if not self.active_connections[session_id]:
+                self.active_connections.pop(session_id, None)
+                self.rate_limiter.remove(session_id)
+            logger.info(f"[WS DISCONNECT] WebSocket disconnected for session: {session_id}")
 
     async def send_json(self, session_id: UUID, data: dict):
-        websocket = self.active_connections.get(session_id)
-        if websocket:
-            await websocket.send_json(data)
+        sockets = list(self.active_connections.get(session_id, []))
+        dead_sockets = []
+        for ws in sockets:
+            try:
+                await ws.send_json(data)
+            except Exception as exc:
+                logger.debug(f"[WS SEND ERROR] Failed to send to socket in session {session_id}: {exc}")
+                dead_sockets.append(ws)
+
+        for ws in dead_sockets:
+            if session_id in self.active_connections and ws in self.active_connections[session_id]:
+                self.active_connections[session_id].remove(ws)
 
 
 connection_manager = InterviewConnectionManager()

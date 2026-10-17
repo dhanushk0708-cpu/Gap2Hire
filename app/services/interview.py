@@ -113,6 +113,43 @@ async def create_interview_session(
     if not capabilities:
         raise NoApprovedCapabilitiesError("Job has no approved capabilities for an interview")
 
+    # 1. Ensure approved interview plan exists for this application
+    plan_stmt = select(InterviewPlan).where(
+        InterviewPlan.application_id == application.id,
+        InterviewPlan.organization_id == organization_id,
+        InterviewPlan.status == "APPROVED",
+    )
+    approved_plan = await session.scalar(plan_stmt)
+    if not approved_plan:
+        try:
+            from app.services.interview_plan import approve_interview_plan, generate_interview_plan
+            draft_plan = await generate_interview_plan(
+                session=session,
+                application_id=application.id,
+                organization_id=organization_id,
+            )
+            await approve_interview_plan(
+                session=session,
+                plan_id=draft_plan.id,
+                organization_id=organization_id,
+                approval_notes="Auto-approved for direct interview session execution",
+            )
+        except Exception as plan_err:
+            logger.info(f"Notice on plan auto-generation/approval: {plan_err}")
+
+    # 2. Check if an active session already exists (idempotent reuse)
+    existing_session_stmt = (
+        select(InterviewSession)
+        .where(
+            InterviewSession.application_id == application.id,
+            InterviewSession.status.in_(["CREATED", "IN_PROGRESS", "SCHEDULED"]),
+        )
+        .order_by(InterviewSession.created_at.desc())
+    )
+    existing_session = await session.scalar(existing_session_stmt)
+    if existing_session:
+        return existing_session
+
     interview_session = InterviewSession(
         application_id=application.id,
         status="CREATED",
@@ -134,9 +171,12 @@ async def start_interview_session(
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
 
-    if interview_session.status != "CREATED":
+    if interview_session.status == "IN_PROGRESS":
+        return interview_session
+
+    if interview_session.status not in ("CREATED", "SCHEDULED"):
         raise InvalidSessionStateError(
-            f"Cannot start interview in status '{interview_session.status}'. Expected 'CREATED'."
+            f"Cannot start interview in status '{interview_session.status}'. Expected 'CREATED' or 'SCHEDULED'."
         )
 
     # Server-side interview gating: Candidate must not be NOT_SHORTLISTED

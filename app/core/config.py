@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     max_resume_size_bytes: int = 10 * 1024 * 1024  # 10 MB
     enable_demo_import: bool = True
 
+    # RAG / Embedding Settings
+    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_dimension: int = 384
+
     # Voice / Audio Settings
     stt_provider: str = "groq"
     stt_api_key: str = ""

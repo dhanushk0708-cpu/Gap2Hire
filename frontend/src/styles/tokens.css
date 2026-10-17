@@ -1,0 +1,95 @@
+:root {
+  /* Surface and Background - Pure Light Mode */
+  --bg-app: #F8FAFC;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F1F5F9;
+  --bg-muted: #E2E8F0;
+  --bg-hover: #F8FAFC;
+
+  /* Borders */
+  --border-light: #F1F5F9;
+  --border-base: #E2E8F0;
+  --border-strong: #CBD5E1;
+
+  /* Typography Colors */
+  --text-main: #0F172A;
+  --text-secondary: #475569;
+  --text-muted: #64748B;
+  --text-tertiary: #94A3B8;
+  --text-inverse: #FFFFFF;
+
+  /* Brand Primary */
+  --primary-50: #EFF6FF;
+  --primary-100: #DBEAFE;
+  --primary-200: #BFDBFE;
+  --primary-500: #3B82F6;
+  --primary-600: #2563EB;
+  --primary-700: #1D4ED8;
+  --primary-800: #1E40AF;
+
+  /* Evidence Semantic Tokens */
+  /* DEMONSTRATED - Emerald */
+  --evidence-demonstrated-bg: #ECFDF5;
+  --evidence-demonstrated-text: #065F46;
+  --evidence-demonstrated-border: #A7F3D0;
+  --evidence-demonstrated-dot: #10B981;
+
+  /* CLAIM - Blue */
+  --evidence-claim-bg: #EFF6FF;
+  --evidence-claim-text: #1E40AF;
+  --evidence-claim-border: #BFDBFE;
+  --evidence-claim-dot: #3B82F6;
+
+  /* VERIFIED - Green */
+  --evidence-verified-bg: #F0FDF4;
+  --evidence-verified-text: #166534;
+  --evidence-verified-border: #BBF7D0;
+  --evidence-verified-dot: #22C55E;
+
+  /* UNKNOWN - Slate */
+  --evidence-unknown-bg: #F8FAFC;
+  --evidence-unknown-text: #475569;
+  --evidence-unknown-border: #E2E8F0;
+  --evidence-unknown-dot: #94A3B8;
+
+  /* VERIFICATION_NEEDED - Amber */
+  --evidence-vneed-bg: #FFFBEB;
+  --evidence-vneed-text: #92400E;
+  --evidence-vneed-border: #FDE68A;
+  --evidence-vneed-dot: #F59E0B;
+
+  /* INSUFFICIENT - Rose/Red */
+  --evidence-insufficient-bg: #FEF2F2;
+  --evidence-insufficient-text: #991B1B;
+  --evidence-insufficient-border: #FECACA;
+  --evidence-insufficient-dot: #EF4444;
+
+  /* Demo / Badge Tag */
+  --badge-demo-bg: #FAF5FF;
+  --badge-demo-text: #6B21A8;
+  --badge-demo-border: #E9D5FF;
+
+  /* Fonts */
+  --font-heading: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-body: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+  --shadow-card: 0 1px 3px 0 rgba(15, 23, 42, 0.06), 0 1px 2px -1px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 4px 6px -1px rgba(15, 23, 42, 0.07), 0 2px 4px -2px rgba(15, 23, 42, 0.04);
+  --shadow-lg: 0 10px 15px -3px rgba(15, 23, 42, 0.08), 0 4px 6px -4px rgba(15, 23, 42, 0.04);
+  --shadow-modal: 0 20px 25px -5px rgba(15, 23, 42, 0.12), 0 8px 10px -6px rgba(15, 23, 42, 0.06);
+
+  /* Radii */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Transitions */
+  --transition-fast: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-normal: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+}

@@ -113,6 +113,8 @@ class PostInterviewIntegrityObservation(BaseModel):
     count: int
     occurred_at_list: list[str] = Field(default_factory=list)
     summary: str
+    evidence_references: list[str] = Field(default_factory=list)
+    evidence_urls: list[str] = Field(default_factory=list)
 
 
 class PostInterviewIntegritySummary(BaseModel):

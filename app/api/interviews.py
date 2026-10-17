@@ -557,6 +557,103 @@ async def get_interview_integrity_events_endpoint(
         )
 
 
+@router.get(
+    "/api/v1/interviews/{session_id}/integrity-evidence/{event_id}",
+    status_code=status.HTTP_200_OK,
+)
+async def get_interview_integrity_evidence_endpoint(
+    session_id: UUID,
+    event_id: UUID,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Retrieve captured evidence JPEG frame for an authorized interview session."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from app.core.config import settings
+    from app.services.interview_integrity import get_authorized_interview_session_for_integrity
+
+    try:
+        await get_authorized_interview_session_for_integrity(
+            session=session,
+            session_id=session_id,
+            user=current_user,
+        )
+    except IntegritySessionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Interview session {session_id} not found.",
+        )
+    except IntegritySessionAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to view evidence for this session.",
+        )
+
+    evidence_file = Path(settings.vision_storage_dir) / str(session_id) / f"{event_id}.jpg"
+    if not evidence_file.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evidence frame not found.",
+        )
+
+    return FileResponse(str(evidence_file), media_type="image/jpeg")
+
+
+class VisionFramePayload(BaseModel):
+    image: str
+
+
+@router.post(
+    "/api/v1/interviews/{session_id}/vision-frame",
+    status_code=status.HTTP_200_OK,
+)
+async def process_interview_vision_frame_endpoint(
+    session_id: UUID,
+    payload: VisionFramePayload,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Process a sampled webcam frame from candidate during live interview."""
+    import base64
+    from app.services.interview_integrity import get_authorized_interview_session_for_integrity
+    from app.services.vision_service import vision_service
+
+    try:
+        await get_authorized_interview_session_for_integrity(
+            session=session,
+            session_id=session_id,
+            user=current_user,
+        )
+    except IntegritySessionNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Interview session {session_id} not found.",
+        )
+    except IntegritySessionAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to submit frames for this session.",
+        )
+
+    raw_b64 = payload.image
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    try:
+        img_bytes = base64.b64decode(raw_b64)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid base64 image data.")
+
+    events = await vision_service.process_sampled_frame(
+        session_id=session_id,
+        image_bytes=img_bytes,
+        user=current_user,
+        db_session=session,
+    )
+    return {"status": "ok", "events_triggered": len(events), "events": events}
+
+
 @router.post(
     "/api/v1/interviews/{session_id}/report",
     response_model=InterviewReport,

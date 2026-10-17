@@ -127,29 +127,31 @@ def classify_email(email: NormalizedEmail) -> tuple[EmailClassificationEnum, str
         if re.search(pattern, combined_text):
             return EmailClassificationEnum.IRRELEVANT, f"Internal organizational subject pattern: {pattern}"
 
-    # 3. Candidate Application intent check
-    has_app_signals = False
-    for pattern in APPLICATION_KEYWORDS:
-        if re.search(pattern, combined_text):
-            has_app_signals = True
-            break
+    # 3. Direct Attachment Inspection: If valid resume PDF attached, it is a CANDIDATE_APPLICATION
+    primary_att, att_cls = find_primary_resume(email.attachments)
+    if att_cls == AttachmentClassificationEnum.VALID_RESUME_PDF:
+        return EmailClassificationEnum.CANDIDATE_APPLICATION, "Candidate application with valid resume PDF."
+
+    if att_cls == AttachmentClassificationEnum.POSSIBLE_RESUME_DOC:
+        return EmailClassificationEnum.CANDIDATE_APPLICATION, "Candidate application with Word document resume."
+
+    # 4. Candidate Application intent check for emails without valid resume attachment
+    has_app_signals = any(re.search(pattern, combined_text) for pattern in APPLICATION_KEYWORDS)
 
     if has_app_signals:
-        primary_att, att_cls = find_primary_resume(email.attachments)
-
-        if att_cls == AttachmentClassificationEnum.VALID_RESUME_PDF:
-            return EmailClassificationEnum.CANDIDATE_APPLICATION, "Candidate application with valid resume PDF."
-
-        if att_cls == AttachmentClassificationEnum.POSSIBLE_RESUME_DOC:
-            return EmailClassificationEnum.CANDIDATE_APPLICATION, "Candidate application with Word document resume."
-
         if att_cls == AttachmentClassificationEnum.INVALID_ATTACHMENT:
-            return EmailClassificationEnum.POSSIBLE_APPLICATION, "Application intent detected with invalid attachment format."
+            return EmailClassificationEnum.POSSIBLE_APPLICATION, "INVALID_PDF: Application intent detected with invalid attachment format."
 
         if not email.attachments:
-            return EmailClassificationEnum.POSSIBLE_APPLICATION, "Application intent detected without resume attachment."
+            return EmailClassificationEnum.POSSIBLE_APPLICATION, "NO_RESUME_ATTACHMENT: Application intent detected without resume attachment."
 
-        return EmailClassificationEnum.POSSIBLE_APPLICATION, "Application intent detected with non-resume attachment."
+        return EmailClassificationEnum.POSSIBLE_APPLICATION, "UNSUPPORTED_ATTACHMENT: Application intent detected with non-resume attachment."
 
-    # 4. Unknown / Unclear
-    return EmailClassificationEnum.UNKNOWN, "No clear candidate application or operational signals detected."
+    # 5. Clear Skip Reasons when no resume and no application intent
+    if not email.attachments:
+        return EmailClassificationEnum.UNKNOWN, "NO_RESUME_ATTACHMENT: Email contains no attachments."
+
+    if att_cls == AttachmentClassificationEnum.INVALID_ATTACHMENT:
+        return EmailClassificationEnum.UNKNOWN, "INVALID_PDF: Email attachment format is invalid or prohibited."
+
+    return EmailClassificationEnum.UNKNOWN, "UNSUPPORTED_ATTACHMENT: Attachment is not a supported PDF resume."

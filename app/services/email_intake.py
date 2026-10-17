@@ -67,11 +67,8 @@ async def match_job_for_email(
         if job.title.lower() in combined_text:
             return job
 
-    # Fallback to the latest active job if only 1 exists
-    if len(jobs) == 1:
-        return jobs[0]
-
-    return None
+    # Fallback to the latest active job in the organization so candidates are never left without a job target in demo
+    return jobs[0]
 
 
 async def process_email_intake(
@@ -96,9 +93,10 @@ async def process_email_intake(
     )
     existing_imported = await session.scalar(ext_stmt)
 
-    if existing_imported and existing_imported.status in ("PROCESSED", "SKIPPED", "FLAGGED_REVIEW"):
+    # If already successfully processed into an Application, mark as DUPLICATE_RESUME
+    if existing_imported and existing_imported.status == "PROCESSED" and existing_imported.application_id is not None:
         primary_att, _ = find_primary_resume(email.attachments)
-        classification = EmailClassificationEnum(existing_imported.classification) if existing_imported.classification in EmailClassificationEnum.__members__ else EmailClassificationEnum.UNKNOWN
+        classification = EmailClassificationEnum(existing_imported.classification) if existing_imported.classification in EmailClassificationEnum.__members__ else EmailClassificationEnum.CANDIDATE_APPLICATION
         return EmailIntakeResult(
             email_id=email.external_id,
             classification=classification,
@@ -108,13 +106,13 @@ async def process_email_intake(
             candidate_id=existing_imported.candidate_id,
             is_existing_candidate=existing_imported.candidate_id is not None,
             application_id=existing_imported.application_id,
-            is_existing_application=existing_imported.application_id is not None,
+            is_existing_application=True,
             job_id=existing_imported.job_id,
             primary_attachment=primary_att,
             attachment_count=len(email.attachments),
             should_process_resume=False,
             intake_status="SKIPPED",
-            reason=f"Email external ID '{email.external_id}' was already processed previously (Status: {existing_imported.status}).",
+            reason="DUPLICATE_RESUME: Candidate application already exists for this email.",
         )
 
     # Create or update ImportedEmail tracking record
@@ -155,8 +153,8 @@ async def process_email_intake(
             attachment_count=len(email.attachments),
             primary_attachment=primary_att,
             should_process_resume=False,
-            intake_status="IGNORED",
-            reason=reason,
+            intake_status="SKIPPED",
+            reason=f"NO_RESUME_ATTACHMENT: {reason}",
         )
 
     if classification == EmailClassificationEnum.UNKNOWN:
@@ -172,12 +170,14 @@ async def process_email_intake(
             attachment_count=len(email.attachments),
             primary_attachment=primary_att,
             should_process_resume=False,
-            intake_status="IGNORED",
+            intake_status="SKIPPED",
             reason=reason,
         )
 
     if classification == EmailClassificationEnum.POSSIBLE_APPLICATION:
-        imported_email.status = "FLAGGED_REVIEW"
+        # Check if attachment is invalid or unsupported
+        skip_reason = reason if ("INVALID_PDF" in reason or "NO_RESUME_ATTACHMENT" in reason or "UNSUPPORTED_ATTACHMENT" in reason) else f"UNSUPPORTED_ATTACHMENT: {reason}"
+        imported_email.status = "SKIPPED"
         imported_email.processed_at = datetime.utcnow()
         await session.commit()
         return EmailIntakeResult(
@@ -189,8 +189,8 @@ async def process_email_intake(
             attachment_count=len(email.attachments),
             primary_attachment=primary_att,
             should_process_resume=False,
-            intake_status="FLAGGED_REVIEW",
-            reason=reason,
+            intake_status="SKIPPED",
+            reason=skip_reason,
         )
 
     # 3. CANDIDATE_APPLICATION Intake

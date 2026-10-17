@@ -1,6 +1,7 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.authorization import require_roles
@@ -150,6 +151,7 @@ async def get_google_oauth_url_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def google_oauth_callback_endpoint(
+    request: Request,
     code: str,
     state: str = "",
     session: AsyncSession = Depends(get_db_session),
@@ -158,6 +160,7 @@ async def google_oauth_callback_endpoint(
     import json
     from app.models.organization import Organization
     from app.services.gmail_provider import exchange_google_code_for_tokens
+    from fastapi.responses import HTMLResponse
 
     try:
         token_data = await exchange_google_code_for_tokens(code)
@@ -199,11 +202,44 @@ async def google_oauth_callback_endpoint(
         }),
     )
 
-    return await create_email_connection(
+    created_conn = await create_email_connection(
         session=session,
         organization_id=org_id,
         data=conn_data,
     )
+
+    # If redirected from a browser, display a success redirect page back to the app UI
+    accept_header = request.headers.get("accept", "")
+    if "text/html" in accept_header:
+        html_page = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Gmail Connected - Gap2Hire</title>
+            <meta http-equiv="refresh" content="2;url=http://localhost:5173/screening?gmail_connected=true" />
+            <style>
+                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8FAFC; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+                .card { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 36px 48px; text-align: center; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); max-width: 440px; }
+                .icon { width: 52px; height: 52px; border-radius: 50%; background: #DCFCE7; color: #16A34A; display: inline-flex; align-items: center; justify-content: center; font-size: 26px; margin: 0 auto 16px auto; }
+                h2 { color: #0F172A; font-size: 20px; font-weight: 600; margin: 0 0 8px 0; }
+                p { color: #64748B; font-size: 14px; margin: 0 0 24px 0; line-height: 1.5; }
+                .btn { display: inline-block; background: #2563EB; color: #FFFFFF; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s; }
+                .btn:hover { background: #1D4ED8; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <div class="icon">✓</div>
+                <h2>Gmail Connected Successfully!</h2>
+                <p>Your Gmail account has been securely linked to Gap2Hire. Redirecting you to the Screening Queue...</p>
+                <a class="btn" href="http://localhost:5173/screening?gmail_connected=true">Continue to Screening Queue</a>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_page)
+
+    return created_conn
 
 
 @router.post(

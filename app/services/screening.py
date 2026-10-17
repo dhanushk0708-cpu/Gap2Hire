@@ -63,7 +63,8 @@ async def evaluate_candidate_eligibility(
     for ev in evidence_list:
         ev_map.setdefault(ev.capability_id, []).append(ev)
 
-    sources = candidate_sources if candidate_sources is not None else getattr(application, "sources", [])
+    # Use explicitly supplied candidate_sources; if None, avoid lazy DB load by using empty list
+    sources = candidate_sources if candidate_sources is not None else []
     sources_map = {s.id: s for s in sources} if sources else {}
 
     provenance_weights = {"VERIFIED": 4, "DEMONSTRATED": 3, "CORROBORATED": 2, "CLAIM": 1, "UNKNOWN": 0}
@@ -287,6 +288,10 @@ async def build_candidate_screening_report(
         explanation += "Project artifacts provide preliminary demonstration. Independent verification is still required."
     else:
         explanation += "Candidate has independently verified capabilities."
+    # Append unknown requirement names if any
+    if unknowns_summary:
+        unknown_names = ", ".join(unknowns_summary)
+        explanation += f" Unknown requirements requiring verification: {unknown_names}."
 
     # Synchronize screening status on application if still PENDING
     if application.screening_status == "PENDING":
