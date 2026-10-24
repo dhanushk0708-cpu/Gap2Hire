@@ -1,33 +1,36 @@
-import hashlib
-import json
 import logging
-import os
-import urllib.parse
-from datetime import datetime, timedelta, timezone
-from typing import Any
+import secrets
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 from uuid import UUID, uuid4
 
-import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.application import Application
 from app.models.candidate import Candidate
-from app.models.email_connection import EmailConnection
 from app.models.interview import InterviewSession
 from app.models.interview_plan import InterviewPlan
 from app.models.interview_schedule import InterviewSchedule
 from app.models.job import Job
 from app.models.organization import Organization
+from app.models.user import User
 from app.schemas.interview_schedule import InterviewScheduleResponse
-from app.services.interview import get_tenant_interview_session
+from app.services.interview import create_interview_session, get_tenant_interview_session
+from app.services.meeting_links import (
+    default_meeting_provider,
+    generate_interview_reference,
+)
+from app.services.simulated_notifications import (
+    build_idempotency_key,
+    format_cancelled_notification,
+    format_invitation_notification,
+    format_rescheduled_notification,
+    record_simulated_notification,
+)
 
 logger = logging.getLogger(__name__)
-
-# Minimum required Google OAuth scopes for scheduling & invitations
-GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events"
-GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
 
 class SchedulingError(Exception):
@@ -41,7 +44,7 @@ class UnapprovedPlanError(SchedulingError):
 
 
 class DuplicateScheduleError(SchedulingError):
-    """Raised when an interview session is already scheduled."""
+    """Raised when an interview session or time slot is already scheduled."""
     pass
 
 
@@ -50,84 +53,622 @@ class InvalidScheduleTimeError(SchedulingError):
     pass
 
 
-def generate_meet_link(seed: str) -> tuple[str, str]:
-    """
-    Generates a deterministic Google Meet link format and calendar event ID
-    for sandboxed / offline execution environments.
-    Format: https://meet.google.com/xxx-yyyy-zzz
-    """
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    part1 = h[0:3]
-    part2 = h[3:7]
-    part3 = h[7:10]
-    meet_url = f"https://meet.google.com/{part1}-{part2}-{part3}"
-    calendar_event_id = f"evt_{h[:16]}"
-    return meet_url, calendar_event_id
+class InterviewerConflictError(SchedulingError):
+    """Raised when the assigned interviewer has an overlapping active interview."""
+    pass
 
 
-async def create_google_calendar_event(
-    access_token: str,
-    title: str,
-    description: str,
+class InvalidInterviewStateError(SchedulingError):
+    """Raised when an operation is invalid for current interview status."""
+    pass
+
+
+async def check_interviewer_conflict(
+    session: AsyncSession,
+    organization_id: UUID,
+    interviewer_id: UUID,
     start_time: datetime,
     end_time: datetime,
-    timezone_name: str,
-    attendee_email: str | None = None,
-) -> tuple[str, str]:
+    exclude_schedule_id: Optional[UUID] = None,
+) -> None:
     """
-    Creates a calendar event with Google Meet conference data using Google Calendar API.
-    Falls back gracefully if token lacks calendar permission or offline.
+    Detects scheduling conflicts for the specified interviewer.
+    Checks for overlapping active interviews (SCHEDULED or CONFIRMED).
     """
-    url = "https://www.googleapis.com/calendar/v3/calendars/primary/events?conferenceDataVersion=1"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-    request_id = str(uuid4())
-    payload = {
-        "summary": title,
-        "description": description,
-        "start": {
-            "dateTime": start_time.isoformat(),
-            "timeZone": timezone_name,
-        },
-        "end": {
-            "dateTime": end_time.isoformat(),
-            "timeZone": timezone_name,
-        },
-        "conferenceData": {
-            "createRequest": {
-                "requestId": request_id,
-                "conferenceSolutionKey": {"type": "hangoutsMeet"},
-            }
-        },
-    }
-    if attendee_email:
-        payload["attendees"] = [{"email": attendee_email}]
+    stmt = (
+        select(InterviewSchedule)
+        .where(
+            InterviewSchedule.organization_id == organization_id,
+            InterviewSchedule.interviewer_id == interviewer_id,
+            InterviewSchedule.status.in_(["SCHEDULED", "CONFIRMED"]),
+            InterviewSchedule.scheduled_start < end_time,
+            InterviewSchedule.scheduled_end > start_time,
+        )
+    )
+    if exclude_schedule_id:
+        stmt = stmt.where(InterviewSchedule.id != exclude_schedule_id)
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.is_success:
-                data = resp.json()
-                event_id = data.get("id", f"cal_{uuid4().hex[:12]}")
-                conf_data = data.get("conferenceData", {})
-                entry_points = conf_data.get("entryPoints", [])
-                meet_url = next(
-                    (ep.get("uri") for ep in entry_points if ep.get("entryPointType") == "video"),
-                    data.get("hangoutLink", None),
-                )
-                if meet_url:
-                    return meet_url, event_id
-            else:
-                logger.warning(f"Google Calendar API returned {resp.status_code}: {resp.text}")
-    except Exception as exc:
-        logger.warning(f"Failed to connect to Google Calendar API: {exc}")
-
-    # Fallback deterministic meet link
-    return generate_meet_link(f"{title}_{start_time.isoformat()}")
+    conflicting = await session.scalar(stmt)
+    if conflicting is not None:
+        c_start = conflicting.scheduled_start.strftime("%Y-%m-%d %H:%M UTC")
+        c_end = conflicting.scheduled_end.strftime("%H:%M UTC")
+        ref = conflicting.interview_reference or str(conflicting.id)[:8]
+        raise InterviewerConflictError(
+            f"Interviewer conflict: Interviewer already has an active interview ({ref}) scheduled from {c_start} to {c_end}."
+        )
 
 
+def _to_schedule_response(sched: InterviewSchedule) -> InterviewScheduleResponse:
+    app_obj = sched.application
+    cand = app_obj.candidate if app_obj else None
+    job = app_obj.job if app_obj else None
+    interviewer_user = sched.interviewer
+
+    return InterviewScheduleResponse(
+        id=sched.id,
+        session_id=sched.session_id,
+        organization_id=sched.organization_id,
+        application_id=sched.application_id,
+        interviewer_id=sched.interviewer_id,
+        interviewer_name=interviewer_user.full_name if interviewer_user else None,
+        scheduled_start=sched.scheduled_start,
+        scheduled_end=sched.scheduled_end,
+        timezone=sched.timezone,
+        duration_minutes=sched.duration_minutes,
+        calendar_event_id=sched.calendar_event_id,
+        meeting_url=sched.meeting_url,
+        status=sched.status,
+        interview_type=sched.interview_type,
+        interview_reference=sched.interview_reference,
+        location=sched.location,
+        cancellation_reason=sched.cancellation_reason,
+        booking_token=sched.booking_token,
+        plan_id=sched.plan_id,
+        round_id=sched.round_id,
+        candidate_email_sent=sched.candidate_email_sent,
+        candidate_email_id=sched.candidate_email_id,
+        invitation_notes=sched.invitation_notes,
+        candidate_id=cand.id if cand else None,
+        candidate_name=cand.full_name if cand else "Candidate",
+        candidate_email=cand.email if cand else "candidate@example.com",
+        job_id=job.id if job else None,
+        job_title=job.title if job else "Role",
+        created_at=sched.created_at,
+        updated_at=sched.updated_at,
+    )
+
+
+async def schedule_interview_for_application(
+    session: AsyncSession,
+    application_id: UUID,
+    organization_id: UUID,
+    scheduled_start: datetime,
+    timezone_name: str = "UTC",
+    duration_minutes: int = 45,
+    interviewer_id: Optional[UUID] = None,
+    interview_type: str = "ONLINE",
+    location: Optional[str] = None,
+    invitation_notes: Optional[str] = None,
+    created_by: Optional[UUID] = None,
+    plan_id: Optional[UUID] = None,
+    round_id: Optional[UUID] = None,
+) -> InterviewScheduleResponse:
+    """
+    Schedules an interview for a candidate application:
+    1. Validates application ownership and candidate status.
+    2. Validates start time (must be future) and duration bounds (15-180 min).
+    3. Detects interviewer scheduling conflicts.
+    4. Automatically binds/creates underlying InterviewSession.
+    5. Generates unique reference (e.g. INT-2026-XXXX) and demo meeting link.
+    6. Persists InterviewSchedule record.
+    7. Generates and persists simulated demo email notification.
+    """
+    # 1. Fetch application with validation
+    app_stmt = (
+        select(Application)
+        .join(Job, Job.id == Application.job_id)
+        .where(
+            Application.id == application_id,
+            Job.organization_id == organization_id,
+        )
+        .options(
+            selectinload(Application.candidate),
+            selectinload(Application.job),
+        )
+    )
+    application = await session.scalar(app_stmt)
+    if application is None:
+        raise SchedulingError("Candidate application not found or inaccessible")
+
+    # 2. Validate time and duration
+    now_utc = datetime.now(timezone.utc)
+    start_utc = scheduled_start if scheduled_start.tzinfo else scheduled_start.replace(tzinfo=timezone.utc)
+    if start_utc < now_utc - timedelta(minutes=5):
+        raise InvalidScheduleTimeError("Scheduled start time cannot be in the past.")
+
+    if duration_minutes < 15 or duration_minutes > 180:
+        raise InvalidScheduleTimeError("Duration must be between 15 and 180 minutes.")
+
+    scheduled_end = scheduled_start + timedelta(minutes=duration_minutes)
+
+    # 3. Detect Interviewer conflicts
+    if interviewer_id:
+        # Verify interviewer exists and belongs to the same organization
+        interviewer_stmt = select(User).where(
+            User.id == interviewer_id,
+            User.organization_id == organization_id,
+        )
+        interviewer = await session.scalar(interviewer_stmt)
+        if interviewer is None:
+            raise SchedulingError("Assigned interviewer not found in organization.")
+
+        await check_interviewer_conflict(
+            session=session,
+            organization_id=organization_id,
+            interviewer_id=interviewer_id,
+            start_time=scheduled_start,
+            end_time=scheduled_end,
+        )
+    else:
+        interviewer = None
+
+    # 4. Resolve or initialize InterviewSession
+    sess_stmt = (
+        select(InterviewSession)
+        .where(InterviewSession.application_id == application_id)
+        .order_by(InterviewSession.created_at.desc())
+    )
+    existing_session = await session.scalar(sess_stmt)
+
+    if existing_session is None:
+        existing_session = await create_interview_session(
+            session=session,
+            application_id=application_id,
+            organization_id=organization_id,
+        )
+
+    # 5. Check if session already has an active schedule
+    active_sched_stmt = select(InterviewSchedule).where(
+        InterviewSchedule.session_id == existing_session.id,
+        InterviewSchedule.status.in_(["SCHEDULED", "CONFIRMED"]),
+    )
+    existing_sched = await session.scalar(active_sched_stmt)
+    if existing_sched is not None:
+        raise DuplicateScheduleError(
+            f"An active interview is already scheduled for this session on {existing_sched.scheduled_start.isoformat()} ({existing_sched.status})."
+        )
+
+    # 6. Auto-resolve approved plan_id if not explicitly provided
+    if plan_id is None:
+        from app.models.interview_plan import InterviewPlan
+        appr_plan_stmt = (
+            select(InterviewPlan)
+            .where(
+                InterviewPlan.application_id == application_id,
+                InterviewPlan.organization_id == organization_id,
+                InterviewPlan.status == "APPROVED",
+            )
+            .order_by(InterviewPlan.version.desc())
+        )
+        appr_plan = await session.scalar(appr_plan_stmt)
+        if appr_plan is not None:
+            plan_id = appr_plan.id
+
+    # 7. Generate Reference & Demo Meeting Link
+    interview_ref = generate_interview_reference()
+    meeting_url, cal_event_id = default_meeting_provider.generate_meeting_link(
+        interview_reference=interview_ref,
+        interview_type=interview_type,
+    )
+    booking_token = f"bk_{secrets.token_urlsafe(24)}"
+
+    # 8. Persist Schedule
+    sched_id = uuid4()
+    sched = InterviewSchedule(
+        id=sched_id,
+        session_id=existing_session.id,
+        organization_id=organization_id,
+        application_id=application_id,
+        interviewer_id=interviewer_id,
+        scheduled_start=scheduled_start,
+        scheduled_end=scheduled_end,
+        timezone=timezone_name,
+        duration_minutes=duration_minutes,
+        interview_type=interview_type.upper(),
+        interview_reference=interview_ref,
+        location=location,
+        calendar_event_id=cal_event_id,
+        meeting_url=meeting_url,
+        status="SCHEDULED",
+        candidate_email_sent=True,
+        candidate_email_id=f"sim_email_{sched_id.hex[:12]}",
+        invitation_notes=invitation_notes,
+        booking_token=booking_token,
+        plan_id=plan_id,
+        round_id=round_id,
+        created_by=created_by,
+    )
+    session.add(sched)
+    await session.flush()
+
+    # 8. Dispatch Simulated Email Notification
+    cand_name = application.candidate.full_name if application.candidate else "Candidate"
+    cand_email = application.candidate.email if application.candidate else "candidate@example.com"
+    job_title = application.job.title if application.job else "Position"
+
+    org_stmt = select(Organization).where(Organization.id == organization_id)
+    org = await session.scalar(org_stmt)
+    org_name = org.name if org else "Gap2Hire"
+
+    subj, body = format_invitation_notification(
+        candidate_name=cand_name,
+        job_title=job_title,
+        organization_name=org_name,
+        scheduled_start=scheduled_start,
+        duration_minutes=duration_minutes,
+        timezone_name=timezone_name,
+        interview_reference=interview_ref,
+        interview_type=interview_type.upper(),
+        meeting_url=meeting_url,
+        location=location,
+        interviewer_name=interviewer.full_name if interviewer else None,
+        notes=invitation_notes,
+    )
+    idemp_key = build_idempotency_key(interview_ref, "INVITATION", cand_email)
+    await record_simulated_notification(
+        session=session,
+        organization_id=organization_id,
+        recipient=cand_email,
+        recipient_name=cand_name,
+        subject=subj,
+        body=body,
+        interview_reference=interview_ref,
+        notification_type="INVITATION",
+        interview_schedule_id=sched.id,
+        idempotency_key=idemp_key,
+    )
+
+    await session.commit()
+    await session.refresh(sched)
+
+    # Re-fetch with loaded relations
+    return await get_schedule_by_id(session, sched.id, organization_id)
+
+
+async def get_schedule_by_id(
+    session: AsyncSession,
+    schedule_id: UUID,
+    organization_id: UUID,
+) -> InterviewScheduleResponse:
+    """Retrieves an interview schedule by ID with tenant isolation."""
+    stmt = (
+        select(InterviewSchedule)
+        .where(
+            InterviewSchedule.id == schedule_id,
+            InterviewSchedule.organization_id == organization_id,
+        )
+        .options(
+            selectinload(InterviewSchedule.application).selectinload(Application.candidate),
+            selectinload(InterviewSchedule.application).selectinload(Application.job),
+            selectinload(InterviewSchedule.interviewer),
+        )
+    )
+    sched = await session.scalar(stmt)
+    if sched is None:
+        raise SchedulingError("Interview schedule not found or inaccessible")
+    return _to_schedule_response(sched)
+
+
+async def reschedule_interview(
+    session: AsyncSession,
+    schedule_id: UUID,
+    organization_id: UUID,
+    new_start: Optional[datetime] = None,
+    new_duration: Optional[int] = None,
+    new_timezone: Optional[str] = None,
+    new_interviewer_id: Optional[UUID] = None,
+    new_interview_type: Optional[str] = None,
+    new_location: Optional[str] = None,
+    new_notes: Optional[str] = None,
+    reschedule_reason: Optional[str] = None,
+) -> InterviewScheduleResponse:
+    """
+    Reschedules an active interview schedule:
+    - Validates schedule state (cannot reschedule COMPLETED or CANCELLED).
+    - Checks interviewer conflicts for new time or reassigned interviewer.
+    - Updates demo meeting link if type changed.
+    - Persists changes and simulated notification.
+    """
+    stmt = (
+        select(InterviewSchedule)
+        .where(
+            InterviewSchedule.id == schedule_id,
+            InterviewSchedule.organization_id == organization_id,
+        )
+        .options(
+            selectinload(InterviewSchedule.application).selectinload(Application.candidate),
+            selectinload(InterviewSchedule.application).selectinload(Application.job),
+            selectinload(InterviewSchedule.interviewer),
+        )
+    )
+    sched = await session.scalar(stmt)
+    if sched is None:
+        raise SchedulingError("Interview schedule not found")
+
+    if sched.status in ["COMPLETED", "CANCELLED"]:
+        raise InvalidInterviewStateError(
+            f"Cannot reschedule an interview in status '{sched.status}'."
+        )
+
+    target_start = new_start or sched.scheduled_start
+    target_duration = new_duration or sched.duration_minutes
+    target_interviewer_id = new_interviewer_id if new_interviewer_id is not None else sched.interviewer_id
+    target_type = new_interview_type.upper() if new_interview_type else sched.interview_type
+
+    now_utc = datetime.now(timezone.utc)
+    start_utc = target_start if target_start.tzinfo else target_start.replace(tzinfo=timezone.utc)
+    if start_utc < now_utc - timedelta(minutes=5):
+        raise InvalidScheduleTimeError("Rescheduled start time cannot be in the past.")
+
+    if target_duration < 15 or target_duration > 180:
+        raise InvalidScheduleTimeError("Duration must be between 15 and 180 minutes.")
+
+    target_end = target_start + timedelta(minutes=target_duration)
+
+    # Check conflicts
+    if target_interviewer_id:
+        await check_interviewer_conflict(
+            session=session,
+            organization_id=organization_id,
+            interviewer_id=target_interviewer_id,
+            start_time=target_start,
+            end_time=target_end,
+            exclude_schedule_id=sched.id,
+        )
+
+    # Update meeting url if type changed
+    if target_type != sched.interview_type:
+        sched.meeting_url, sched.calendar_event_id = default_meeting_provider.generate_meeting_link(
+            interview_reference=sched.interview_reference or str(sched.id)[:8],
+            interview_type=target_type,
+        )
+
+    sched.scheduled_start = target_start
+    sched.scheduled_end = target_end
+    sched.duration_minutes = target_duration
+    if new_timezone:
+        sched.timezone = new_timezone
+    if new_interviewer_id is not None:
+        sched.interviewer_id = new_interviewer_id
+    sched.interview_type = target_type
+    if new_location is not None:
+        sched.location = new_location
+    if new_notes is not None:
+        sched.invitation_notes = new_notes
+
+    # Keep status as CONFIRMED or SCHEDULED
+    if sched.status != "CONFIRMED":
+        sched.status = "SCHEDULED"
+
+    # Send simulated notification
+    app_obj = sched.application
+    cand = app_obj.candidate if app_obj else None
+    job = app_obj.job if app_obj else None
+    cand_name = cand.full_name if cand else "Candidate"
+    cand_email = cand.email if cand else "candidate@example.com"
+    job_title = job.title if job else "Role"
+
+    org_stmt = select(Organization).where(Organization.id == organization_id)
+    org = await session.scalar(org_stmt)
+    org_name = org.name if org else "Gap2Hire"
+
+    subj, body = format_rescheduled_notification(
+        candidate_name=cand_name,
+        job_title=job_title,
+        organization_name=org_name,
+        new_start=target_start,
+        duration_minutes=target_duration,
+        timezone_name=sched.timezone,
+        interview_reference=sched.interview_reference or "REF",
+        interview_type=target_type,
+        meeting_url=sched.meeting_url,
+        location=sched.location,
+        reason=reschedule_reason,
+    )
+    idemp_key = build_idempotency_key(
+        sched.interview_reference or str(sched.id),
+        "RESCHEDULE",
+        cand_email,
+        timestamp_bucket=target_start.isoformat(),
+    )
+    await record_simulated_notification(
+        session=session,
+        organization_id=organization_id,
+        recipient=cand_email,
+        recipient_name=cand_name,
+        subject=subj,
+        body=body,
+        interview_reference=sched.interview_reference or "REF",
+        notification_type="RESCHEDULE",
+        interview_schedule_id=sched.id,
+        idempotency_key=idemp_key,
+    )
+
+    await session.commit()
+    return await get_schedule_by_id(session, sched.id, organization_id)
+
+
+async def cancel_interview(
+    session: AsyncSession,
+    schedule_id: UUID,
+    organization_id: UUID,
+    cancellation_reason: str,
+) -> InterviewScheduleResponse:
+    """
+    Cancels an active interview schedule:
+    - Sets status to CANCELLED.
+    - Records cancellation reason.
+    - Dispatches simulated cancellation notification.
+    """
+    stmt = (
+        select(InterviewSchedule)
+        .where(
+            InterviewSchedule.id == schedule_id,
+            InterviewSchedule.organization_id == organization_id,
+        )
+        .options(
+            selectinload(InterviewSchedule.application).selectinload(Application.candidate),
+            selectinload(InterviewSchedule.application).selectinload(Application.job),
+        )
+    )
+    sched = await session.scalar(stmt)
+    if sched is None:
+        raise SchedulingError("Interview schedule not found")
+
+    if sched.status == "CANCELLED":
+        raise InvalidInterviewStateError("Interview is already cancelled.")
+    if sched.status == "COMPLETED":
+        raise InvalidInterviewStateError("Cannot cancel a completed interview.")
+
+    sched.status = "CANCELLED"
+    sched.cancellation_reason = cancellation_reason
+
+    # Send simulated notification
+    app_obj = sched.application
+    cand = app_obj.candidate if app_obj else None
+    job = app_obj.job if app_obj else None
+    cand_name = cand.full_name if cand else "Candidate"
+    cand_email = cand.email if cand else "candidate@example.com"
+    job_title = job.title if job else "Role"
+
+    org_stmt = select(Organization).where(Organization.id == organization_id)
+    org = await session.scalar(org_stmt)
+    org_name = org.name if org else "Gap2Hire"
+
+    subj, body = format_cancelled_notification(
+        candidate_name=cand_name,
+        job_title=job_title,
+        organization_name=org_name,
+        interview_reference=sched.interview_reference or "REF",
+        cancellation_reason=cancellation_reason,
+    )
+    idemp_key = build_idempotency_key(
+        sched.interview_reference or str(sched.id),
+        "CANCELLATION",
+        cand_email,
+    )
+    await record_simulated_notification(
+        session=session,
+        organization_id=organization_id,
+        recipient=cand_email,
+        recipient_name=cand_name,
+        subject=subj,
+        body=body,
+        interview_reference=sched.interview_reference or "REF",
+        notification_type="CANCELLATION",
+        interview_schedule_id=sched.id,
+        idempotency_key=idemp_key,
+    )
+
+    await session.commit()
+    return await get_schedule_by_id(session, sched.id, organization_id)
+
+
+async def mark_interview_completed(
+    session: AsyncSession,
+    schedule_id: UUID,
+    organization_id: UUID,
+) -> InterviewScheduleResponse:
+    """
+    Marks an interview as COMPLETED.
+    Synchronously transitions the underlying InterviewSession status to 'COMPLETED'
+    to enable post-interview scorecard generation and candidate workflow advancement.
+    """
+    stmt = (
+        select(InterviewSchedule)
+        .where(
+            InterviewSchedule.id == schedule_id,
+            InterviewSchedule.organization_id == organization_id,
+        )
+        .options(selectinload(InterviewSchedule.session))
+    )
+    sched = await session.scalar(stmt)
+    if sched is None:
+        raise SchedulingError("Interview schedule not found")
+
+    if sched.status == "CANCELLED":
+        raise InvalidInterviewStateError("Cannot mark a cancelled interview as completed.")
+
+    sched.status = "COMPLETED"
+
+    # Transition underlying InterviewSession
+    if sched.session:
+        sched.session.status = "COMPLETED"
+        if not sched.session.ended_at:
+            sched.session.ended_at = datetime.now(timezone.utc)
+
+    await session.commit()
+    return await get_schedule_by_id(session, sched.id, organization_id)
+
+
+async def list_interviews(
+    session: AsyncSession,
+    organization_id: UUID,
+    status_filter: Optional[str] = None,
+    candidate_query: Optional[str] = None,
+    interviewer_id: Optional[UUID] = None,
+    application_id: Optional[UUID] = None,
+    target_date: Optional[date] = None,
+) -> list[InterviewScheduleResponse]:
+    """
+    Retrieves and filters interview schedules with strict organization scoping.
+    """
+    stmt = (
+        select(InterviewSchedule)
+        .join(Application, Application.id == InterviewSchedule.application_id)
+        .join(Candidate, Candidate.id == Application.candidate_id)
+        .where(InterviewSchedule.organization_id == organization_id)
+        .options(
+            selectinload(InterviewSchedule.application).selectinload(Application.candidate),
+            selectinload(InterviewSchedule.application).selectinload(Application.job),
+            selectinload(InterviewSchedule.interviewer),
+        )
+        .order_by(InterviewSchedule.scheduled_start.asc())
+    )
+
+    if status_filter:
+        stmt = stmt.where(InterviewSchedule.status == status_filter.upper())
+
+    if interviewer_id:
+        stmt = stmt.where(InterviewSchedule.interviewer_id == interviewer_id)
+
+    if application_id:
+        stmt = stmt.where(InterviewSchedule.application_id == application_id)
+
+    if candidate_query:
+        cq = f"%{candidate_query.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Candidate.full_name.ilike(cq),
+                Candidate.email.ilike(cq),
+                InterviewSchedule.interview_reference.ilike(cq),
+            )
+        )
+
+    if target_date:
+        # Match day boundaries in UTC
+        start_of_day = datetime(target_date.year, target_date.month, target_date.day, 0, 0, 0, tzinfo=timezone.utc)
+        end_of_day = start_of_day + timedelta(days=1)
+        stmt = stmt.where(
+            InterviewSchedule.scheduled_start >= start_of_day,
+            InterviewSchedule.scheduled_start < end_of_day,
+        )
+
+    results = (await session.scalars(stmt)).all()
+    return [_to_schedule_response(s) for s in results]
+
+
+# Retain backward compatibility helper for existing callers
 def format_candidate_invitation_email(
     candidate_name: str,
     job_title: str,
@@ -136,71 +677,24 @@ def format_candidate_invitation_email(
     duration_minutes: int,
     timezone_name: str,
     meeting_url: str,
-    invitation_notes: str | None = None,
+    invitation_notes: Optional[str] = None,
 ) -> dict[str, str]:
-    """Constructs the professional email subject and body for the candidate invitation."""
-    # Format readable date/time
-    date_str = scheduled_start.strftime("%A, %B %d, %Y")
-    time_str = scheduled_start.strftime("%I:%M %p")
-    end_time = scheduled_start + timedelta(minutes=duration_minutes)
-    end_time_str = end_time.strftime("%I:%M %p")
-
-    subject = f"Interview Invitation: {job_title} at {organization_name}"
-
-    body = (
-        f"Dear {candidate_name},\n\n"
-        f"Congratulations! We are pleased to invite you to an interview for the {job_title} position at {organization_name}.\n\n"
-        f"--- INTERVIEW DETAILS ---\n"
-        f"â€¢ Date: {date_str}\n"
-        f"â€¢ Time: {time_str} - {end_time_str} ({timezone_name})\n"
-        f"â€¢ Duration: {duration_minutes} minutes\n"
-        f"â€¢ Meeting Link: {meeting_url}\n\n"
-        f"--- JOINING INSTRUCTIONS ---\n"
-        f"1. Please join the meeting link 5 minutes prior to the scheduled start time.\n"
-        f"2. Ensure you have a stable internet connection and a quiet environment.\n"
-        f"3. Have your workspace prepared for interactive technical and conceptual problem solving.\n"
+    subj, body = format_invitation_notification(
+        candidate_name=candidate_name,
+        job_title=job_title,
+        organization_name=organization_name,
+        scheduled_start=scheduled_start,
+        duration_minutes=duration_minutes,
+        timezone_name=timezone_name,
+        interview_reference="INT-DEMO",
+        meeting_url=meeting_url,
+        notes=invitation_notes,
     )
-
-    if invitation_notes:
-        body += f"\n--- ADDITIONAL NOTES ---\n{invitation_notes}\n"
-
-    body += (
-        f"\nIf you have any questions or require rescheduling, please reply to this email.\n\n"
-        f"Best regards,\n"
-        f"The Hiring Team\n"
-        f"{organization_name}\n"
-    )
-
     return {
-        "subject": subject,
+        "subject": subj,
         "body": body,
         "meeting_url": meeting_url,
     }
-
-
-async def send_candidate_invitation_email(
-    session: AsyncSession,
-    organization_id: UUID,
-    candidate_email: str,
-    email_payload: dict[str, str],
-) -> tuple[bool, str]:
-    """
-    Sends or records the candidate invitation email.
-    If an active Gmail connection with send capabilities is present, attempts delivery via Gmail API.
-    Otherwise records the sent payload.
-    """
-    # Check for connected organization email
-    conn_stmt = select(EmailConnection).where(
-        EmailConnection.organization_id == organization_id,
-        EmailConnection.status == "ACTIVE",
-    )
-    email_conn = await session.scalar(conn_stmt)
-
-    email_id = f"msg_{uuid4().hex[:16]}"
-    logger.info(
-        f"Candidate invitation formatted for {candidate_email}: Subject='{email_payload['subject']}'"
-    )
-    return True, email_id
 
 
 async def schedule_interview_for_session(
@@ -210,24 +704,15 @@ async def schedule_interview_for_session(
     timezone_name: str,
     duration_minutes: int,
     organization_id: UUID,
-    invitation_notes: str | None = None,
-    created_by: UUID | None = None,
+    invitation_notes: Optional[str] = None,
+    created_by: Optional[UUID] = None,
 ) -> InterviewScheduleResponse:
-    """
-    Schedules an interview session after HR approval:
-    1. Validates tenant session and approved plan.
-    2. Validates timestamp and duration.
-    3. Prevents duplicate scheduling.
-    4. Creates calendar event with Google Meet link.
-    5. Dispatches candidate invitation email.
-    6. Persists InterviewSchedule record.
-    """
-    # 1. Fetch and validate tenant session
+    """Legacy helper scheduling by session_id."""
     interview_session = await get_tenant_interview_session(session, session_id, organization_id)
     if interview_session is None:
         raise SchedulingError("Interview session not found")
 
-    # 2. Check for Approved Plan
+    # Check for approved plan
     plan_stmt = (
         select(InterviewPlan)
         .where(
@@ -241,7 +726,7 @@ async def schedule_interview_for_session(
     if approved_plan is None:
         raise UnapprovedPlanError("Cannot schedule interview: No approved interview plan found for this candidate.")
 
-    # 3. Check for existing active schedule (Duplicate Prevention)
+    # Check for duplicate
     existing_sched_stmt = select(InterviewSchedule).where(
         InterviewSchedule.session_id == interview_session.id,
         InterviewSchedule.organization_id == organization_id,
@@ -253,105 +738,24 @@ async def schedule_interview_for_session(
             f"Interview is already scheduled for {existing_sched.scheduled_start.isoformat()} ({existing_sched.timezone})."
         )
 
-    # 4. Validate start time and duration
+    # Validate time
     now_utc = datetime.now(timezone.utc)
     start_utc = scheduled_start if scheduled_start.tzinfo else scheduled_start.replace(tzinfo=timezone.utc)
-
-    # Allow small 5-minute past threshold for network latency
     if start_utc < now_utc - timedelta(minutes=5):
         raise InvalidScheduleTimeError("Scheduled start time cannot be in the past.")
 
     if duration_minutes < 15 or duration_minutes > 180:
         raise InvalidScheduleTimeError("Duration must be between 15 and 180 minutes.")
 
-    scheduled_end = scheduled_start + timedelta(minutes=duration_minutes)
-
-    # 5. Load Candidate, Job, and Org context for calendar & email
-    app_stmt = (
-        select(Application)
-        .where(Application.id == interview_session.application_id)
-        .options(
-            selectinload(Application.candidate),
-            selectinload(Application.job),
-        )
-    )
-    application = await session.scalar(app_stmt)
-    candidate = application.candidate if application else None
-    job = application.job if application else None
-
-    org_stmt = select(Organization).where(Organization.id == organization_id)
-    organization = await session.scalar(org_stmt)
-    org_name = organization.name if organization else "Gap2Hire"
-
-    cand_name = candidate.full_name if candidate else "Candidate"
-    cand_email = candidate.email if candidate else "candidate@example.com"
-    job_title = job.title if job else "Technical Role"
-
-    # 6. Create Calendar Event and Google Meet Link
-    meet_title = f"Interview: {cand_name} - {job_title} ({org_name})"
-    meet_desc = f"Technical Interview for {job_title} at {org_name}."
-    meet_url, cal_event_id = generate_meet_link(f"{interview_session.id}_{scheduled_start.isoformat()}")
-
-    # 7. Format & Dispatch Candidate Invitation Email
-    email_payload = format_candidate_invitation_email(
-        candidate_name=cand_name,
-        job_title=job_title,
-        organization_name=org_name,
-        scheduled_start=scheduled_start,
-        duration_minutes=duration_minutes,
-        timezone_name=timezone_name,
-        meeting_url=meet_url,
-        invitation_notes=invitation_notes,
-    )
-    email_sent, email_id = await send_candidate_invitation_email(
+    return await schedule_interview_for_application(
         session=session,
-        organization_id=organization_id,
-        candidate_email=cand_email,
-        email_payload=email_payload,
-    )
-
-    # 8. Persist InterviewSchedule record
-    schedule_record = InterviewSchedule(
-        id=uuid4(),
-        session_id=interview_session.id,
-        organization_id=organization_id,
         application_id=interview_session.application_id,
+        organization_id=organization_id,
         scheduled_start=scheduled_start,
-        scheduled_end=scheduled_end,
-        timezone=timezone_name,
+        timezone_name=timezone_name,
         duration_minutes=duration_minutes,
-        calendar_event_id=cal_event_id,
-        meeting_url=meet_url,
-        status="SCHEDULED",
-        candidate_email_sent=email_sent,
-        candidate_email_id=email_id,
         invitation_notes=invitation_notes,
         created_by=created_by,
-    )
-    session.add(schedule_record)
-    await session.commit()
-    await session.refresh(schedule_record)
-
-    return InterviewScheduleResponse(
-        id=schedule_record.id,
-        session_id=schedule_record.session_id,
-        organization_id=schedule_record.organization_id,
-        application_id=schedule_record.application_id,
-        scheduled_start=schedule_record.scheduled_start,
-        scheduled_end=schedule_record.scheduled_end,
-        timezone=schedule_record.timezone,
-        duration_minutes=schedule_record.duration_minutes,
-        calendar_event_id=schedule_record.calendar_event_id,
-        meeting_url=schedule_record.meeting_url,
-        status=schedule_record.status,
-        candidate_email_sent=schedule_record.candidate_email_sent,
-        candidate_email_id=schedule_record.candidate_email_id,
-        invitation_notes=schedule_record.invitation_notes,
-        candidate_name=cand_name,
-        candidate_email=cand_email,
-        job_title=job_title,
-        created_at=schedule_record.created_at,
-        updated_at=schedule_record.updated_at,
     )
 
 
@@ -359,14 +763,9 @@ async def get_interview_schedule(
     session: AsyncSession,
     session_id: UUID,
     organization_id: UUID,
-) -> InterviewScheduleResponse | None:
-    """Retrieves scheduling details for a given session with tenant isolation."""
-    # Verify session belongs to tenant
-    interview_session = await get_tenant_interview_session(session, session_id, organization_id)
-    if interview_session is None:
-        return None
-
-    sched_stmt = (
+) -> Optional[InterviewScheduleResponse]:
+    """Retrieves schedule details by session ID."""
+    stmt = (
         select(InterviewSchedule)
         .where(
             InterviewSchedule.session_id == session_id,
@@ -375,36 +774,11 @@ async def get_interview_schedule(
         .options(
             selectinload(InterviewSchedule.application).selectinload(Application.candidate),
             selectinload(InterviewSchedule.application).selectinload(Application.job),
+            selectinload(InterviewSchedule.interviewer),
         )
         .order_by(InterviewSchedule.created_at.desc())
     )
-    sched = await session.scalar(sched_stmt)
+    sched = await session.scalar(stmt)
     if sched is None:
         return None
-
-    app_obj = sched.application
-    cand_name = app_obj.candidate.full_name if app_obj and app_obj.candidate else None
-    cand_email = app_obj.candidate.email if app_obj and app_obj.candidate else None
-    job_title = app_obj.job.title if app_obj and app_obj.job else None
-
-    return InterviewScheduleResponse(
-        id=sched.id,
-        session_id=sched.session_id,
-        organization_id=sched.organization_id,
-        application_id=sched.application_id,
-        scheduled_start=sched.scheduled_start,
-        scheduled_end=sched.scheduled_end,
-        timezone=sched.timezone,
-        duration_minutes=sched.duration_minutes,
-        calendar_event_id=sched.calendar_event_id,
-        meeting_url=sched.meeting_url,
-        status=sched.status,
-        candidate_email_sent=sched.candidate_email_sent,
-        candidate_email_id=sched.candidate_email_id,
-        invitation_notes=sched.invitation_notes,
-        candidate_name=cand_name,
-        candidate_email=cand_email,
-        job_title=job_title,
-        created_at=sched.created_at,
-        updated_at=sched.updated_at,
-    )
+    return _to_schedule_response(sched)

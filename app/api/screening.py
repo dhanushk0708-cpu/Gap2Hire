@@ -221,6 +221,15 @@ async def update_job_shortlist_size_endpoint(
     job.shortlist_size = body.shortlist_size
     await session.commit()
     await session.refresh(job)
+    try:
+        await run_job_screening_workflow(
+            session=session,
+            job_id=job.id,
+            organization_id=current_user.organization_id,
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Screening re-evaluation notice on shortlist size change: {e}")
     return job
 
 

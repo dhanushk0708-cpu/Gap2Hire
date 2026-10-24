@@ -28,6 +28,7 @@ import {
   applicationsApi,
   screeningApi,
   interviewSessionsApi,
+  interviewSchedulerApi,
 } from '../../core/api/endpoints';
 import { PageHeader } from '../../shared/components/PageHeader';
 import { StatusBadge } from '../../shared/components/StatusBadge';
@@ -48,7 +49,7 @@ export const CandidateWorkspaceView: React.FC = () => {
   const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState<
-    'scorecard' | 'post_scorecard' | 'screening' | 'evidence' | 'resume' | 'replay' | 'outcomes' | 'autopsy'
+    'scorecard' | 'post_scorecard' | 'scheduling' | 'screening' | 'evidence' | 'resume' | 'replay' | 'outcomes' | 'autopsy'
   >('scorecard');
 
   // Evidence Drawer state
@@ -142,6 +143,17 @@ export const CandidateWorkspaceView: React.FC = () => {
     queryKey: ['hiringAutopsy', applicationId],
     queryFn: () => applicationsApi.getHiringAutopsy(applicationId!),
     enabled: !!applicationId && activeTab === 'autopsy',
+  });
+
+  // Load Candidate Scheduled Interviews
+  const {
+    data: candidateInterviews,
+    isLoading: candidateInterviewsLoading,
+    refetch: refetchCandidateInterviews,
+  } = useQuery({
+    queryKey: ['candidateInterviews', applicationId],
+    queryFn: () => interviewSchedulerApi.list({ application_id: applicationId }),
+    enabled: !!applicationId && activeTab === 'scheduling',
   });
 
   // Load Candidate Interview Sessions (to link to report if exists)
@@ -367,6 +379,7 @@ export const CandidateWorkspaceView: React.FC = () => {
         {[
           { key: 'scorecard', label: 'Pre-Interview Scorecard', icon: ClipboardList },
           { key: 'post_scorecard', label: 'Post-Interview Scorecard', icon: Award },
+          { key: 'scheduling', label: 'Interviews & Schedule', icon: Calendar },
           { key: 'screening', label: 'Screening Profile', icon: Layers },
           { key: 'evidence', label: 'Capability Evidence', icon: ShieldCheck },
           { key: 'resume', label: 'Extracted Resume', icon: FileText },
@@ -410,6 +423,94 @@ export const CandidateWorkspaceView: React.FC = () => {
       {/* Tab: Post-Interview Analytical Scorecard */}
       {activeTab === 'post_scorecard' && (
         <PostInterviewScorecardTab applicationId={application.id} />
+      )}
+
+      {/* Tab: Candidate Interviews & Scheduling */}
+      {activeTab === 'scheduling' && (
+        <div className="card" style={{ padding: '1.5rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+            <div>
+              <h3 style={{ fontSize: '1.1rem', margin: 0 }}>Candidate Scheduled Interviews</h3>
+              <p style={{ fontSize: '0.8125rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
+                Manage interview schedules, simulated email invitations, and demonstration video room links.
+              </p>
+            </div>
+            <Link to="/interviews" className="btn btn-primary btn-sm" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+              <Calendar size={14} /> Open Interview Scheduler
+            </Link>
+          </div>
+
+          {candidateInterviewsLoading ? (
+            <Skeleton height={120} />
+          ) : !candidateInterviews || candidateInterviews.length === 0 ? (
+            <EmptyState
+              icon={Calendar}
+              title="No Interviews Scheduled"
+              description="Coordinate an interview or publish self-booking slots for this candidate in the Interview Scheduler."
+              actionText="Schedule Interview"
+              onAction={() => navigate('/interviews')}
+            />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              {candidateInterviews.map((item) => (
+                <div
+                  key={item.id}
+                  style={{
+                    border: '1px solid var(--border-color)',
+                    borderRadius: 'var(--radius-md)',
+                    padding: '1rem',
+                    backgroundColor: 'var(--bg-app)',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    flexWrap: 'wrap',
+                    gap: '1rem',
+                  }}
+                >
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.3rem' }}>
+                      <span style={{ fontWeight: 700, fontSize: '0.9rem' }}>{item.interview_reference || 'REF-DEMO'}</span>
+                      <StatusBadge status={item.status} />
+                      <span style={{ fontSize: '0.6875rem', backgroundColor: '#EFF6FF', color: '#1D4ED8', padding: '0.1rem 0.45rem', borderRadius: '4px', fontWeight: 600 }}>
+                        {item.interview_type}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
+                      Date: <strong>{new Date(item.scheduled_start).toLocaleString()}</strong> ({item.duration_minutes} min) • Interviewer: {item.interviewer_name || 'Unassigned'}
+                    </div>
+                    {item.interview_type === 'ONLINE' && item.meeting_url && (
+                      <div style={{ fontSize: '0.75rem', color: '#2563EB', fontFamily: 'monospace', marginTop: '0.25rem' }}>
+                        Demo Room: {item.meeting_url}
+                      </div>
+                    )}
+                    {item.location && (
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
+                        Location: {item.location}
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                    {item.interview_type === 'ONLINE' && (
+                      <Link
+                        to={`/interview-room/${item.session_id}`}
+                        target="_blank"
+                        className="btn btn-secondary btn-sm"
+                        style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}
+                      >
+                        <Play size={13} />
+                        Candidate Live Room
+                      </Link>
+                    )}
+                    <Link to="/interviews" className="btn btn-primary btn-sm">
+                      Manage in Scheduler
+                    </Link>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       )}
 
       {/* Tab 1: Screening Profile */}

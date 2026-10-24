@@ -1,12 +1,15 @@
 from datetime import datetime
+import json
 import logging
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.config import settings
 from app.models.application import Application
 from app.models.interview_dataset import (
     InterviewDatasetFile,
@@ -21,9 +24,11 @@ from app.models.interview_plan import (
 from app.models.job import Job
 from app.schemas.interview_plan import (
     InterviewPlanApprovalRequest,
+    InterviewPlanQuestionSchema,
     InterviewPlanResponse,
     InterviewPlanRoundSchema,
     InterviewPlanUpdateRequest,
+    RoundQuestionGeneratePreviewRequest,
 )
 from app.services.application import ApplicationNotFoundError
 from app.services.interview_pre_analysis import build_candidate_interview_pre_analysis
@@ -41,6 +46,11 @@ class InvalidPlanStateError(Exception):
     pass
 
 
+class ConcurrentUpdateError(Exception):
+    """Raised when an optimistic concurrency conflict is detected."""
+    pass
+
+
 async def generate_candidate_interview_plan(
     session: AsyncSession,
     application_id: UUID,
@@ -51,9 +61,8 @@ async def generate_candidate_interview_plan(
     """
     Generates a candidate-specific interview plan grounded in the candidate's pre-interview analysis:
     - Selects concepts based on candidate claims, demonstrated skills, and unknowns.
-    - Selects relevant questions from the uploaded question datasets.
-    - Prevents duplicate questions across the candidate's entire plan.
-    - Preserves dataset_question_id references.
+    - Selects relevant questions from the uploaded question datasets or synthesizes grounded questions.
+    - Configures structured round criteria, expected evidence, and question generation mode.
     - Versions the plan (e.g. v1, v2) and marks older drafts as SUPERSEDED.
     """
     # 1. Tenant application & job verification
@@ -87,7 +96,6 @@ async def generate_candidate_interview_plan(
         )
         dataset_file = await session.scalar(file_stmt)
     else:
-        # Default to the most recent dataset file for the job or organization
         file_stmt = (
             select(InterviewDatasetFile)
             .where(
@@ -139,6 +147,7 @@ async def generate_candidate_interview_plan(
         job_id=job.id,
         dataset_file_id=dataset_file.id if dataset_file else None,
         version=new_version,
+        lock_version=1,
         status="DRAFT",
         candidate_strengths_summary=strengths_summary,
         verification_targets_summary=targets_summary,
@@ -146,17 +155,14 @@ async def generate_candidate_interview_plan(
     )
     session.add(plan)
 
-    # Question selection state to guarantee zero duplicate questions
     used_question_ids: set[UUID] = set()
     used_question_texts: set[str] = set()
 
-    # Determine round concepts based on candidate strengths, claims, and unknowns
     claims_concepts = [c["capability_name"] for c in pre_analysis.candidate_claims]
     demonstrated_concepts = [s["capability_name"] for s in pre_analysis.candidate_strengths]
     unknown_concepts = [u["capability_name"] for u in pre_analysis.candidate_unknowns]
 
     # ROUND 1: Core Fundamentals & Primary Claims
-    # Focus: Verify resume claims and foundational technical skills
     round1_concepts = _select_round_concepts(
         primary_list=claims_concepts + demonstrated_concepts,
         fallback_list=pre_analysis.relevant_concepts,
@@ -168,7 +174,19 @@ async def generate_candidate_interview_plan(
         round_number=1,
         title="Round 1 — Core Fundamentals & Preliminary Claims",
         objective="Evaluate core engineering fundamentals and verify preliminary technical resume claims.",
+        description="Foundational assessment testing practical syntax, concepts, and primary resume assertions.",
         concepts=round1_concepts,
+        evaluation_criteria=[
+            "Direct understanding of core architectural patterns and standard library usage.",
+            "Accurate differentiation between conceptual definitions and production implementation.",
+            "Clear technical communication of claimed resume capabilities.",
+        ],
+        expected_evidence=[
+            "Practical code examples or architectural walkthroughs from recent projects.",
+            "Precise identification of common performance pitfalls or memory considerations.",
+        ],
+        question_generation_mode="AI_GENERATED",
+        difficulty="MEDIUM",
         estimated_duration_minutes=30,
         required=True,
         reasoning=(
@@ -191,7 +209,6 @@ async def generate_candidate_interview_plan(
     )
 
     # ROUND 2: Applied Engineering & Gap Probing
-    # Focus: Probe UNKNOWN / INSUFFICIENT capabilities and advanced implementation
     round2_concepts = _select_round_concepts(
         primary_list=unknown_concepts + [c for c in claims_concepts if c not in round1_concepts],
         fallback_list=pre_analysis.relevant_concepts,
@@ -203,7 +220,19 @@ async def generate_candidate_interview_plan(
         round_number=2,
         title="Round 2 — Applied Engineering & Gap Exploration",
         objective="Probe unverified capabilities, architecture patterns, and technical problem-solving depth.",
+        description="Focused deep-dive targeting unverified competencies and edge cases.",
         concepts=round2_concepts,
+        evaluation_criteria=[
+            "Depth of technical reasoning under novel or constrained scenarios.",
+            "Ability to explain trade-offs between speed, maintainability, and scalability.",
+            "Rigorous troubleshooting approach to unverified system areas.",
+        ],
+        expected_evidence=[
+            "Detailed explanation of concurrency, caching, or transaction boundaries.",
+            "Demonstration of defensive programming and failure recovery strategies.",
+        ],
+        question_generation_mode="AI_GENERATED",
+        difficulty="HARD",
         estimated_duration_minutes=35,
         required=True,
         reasoning=(
@@ -226,7 +255,6 @@ async def generate_candidate_interview_plan(
     )
 
     # ROUND 3: Practical Verification & System Design
-    # Focus: Real projects, architecture decisions, trade-offs, debugging
     round3_concepts = pre_analysis.relevant_concepts[:3] if pre_analysis.relevant_concepts else ["Architecture", "System Design"]
     round3 = InterviewPlanRound(
         id=uuid4(),
@@ -234,7 +262,18 @@ async def generate_candidate_interview_plan(
         round_number=3,
         title="Round 3 — Practical Architecture & Production Decisions",
         objective="Examine candidate's real project architecture, design trade-offs, and production troubleshooting decisions.",
+        description="End-to-end design review evaluating system architecture and reliability trade-offs.",
         concepts=round3_concepts,
+        evaluation_criteria=[
+            "Holistic system design encompassing data pipelines, observability, and SLA management.",
+            "Pragmatic balancing of engineering perfection vs business deadlines.",
+        ],
+        expected_evidence=[
+            "Concrete post-mortem or production outage resolution example.",
+            "Clear justification for database, queue, or API paradigm choices.",
+        ],
+        question_generation_mode="AI_GENERATED",
+        difficulty="HARD",
         estimated_duration_minutes=35,
         required=True,
         reasoning="Examines practical engineering execution, real project experience, and architectural decision-making.",
@@ -291,24 +330,20 @@ def _populate_round_questions(
 ):
     seq = 1
 
-    # Candidate claims map for purpose explanation
     claims_set = {c["capability_name"].lower() for c in pre_analysis.candidate_claims}
     unknown_set = {u["capability_name"].lower() for u in pre_analysis.candidate_unknowns}
     demonstrated_set = {s["capability_name"].lower() for s in pre_analysis.candidate_strengths}
 
     for concept in concepts:
         c_lower = concept.lower()
-        # Find matching questions in dataset
         pool = questions_by_concept.get(c_lower, [])
         if not pool:
-            # Fallback search across concepts
             pool = [q for k, qs in questions_by_concept.items() if c_lower in k for q in qs]
 
         for q in pool:
             if q.id in used_question_ids or q.question_text.lower() in used_question_texts:
                 continue
 
-            # Determine purpose based on candidate state
             if c_lower in claims_set:
                 purpose = f"Verify {concept} depth and practical experience (currently resume CLAIM)"
                 ev_ver = f"{concept} (CLAIM)"
@@ -332,6 +367,8 @@ def _populate_round_questions(
                 question_type=q.question_type or "CONCEPTUAL",
                 purpose=purpose,
                 evidence_being_verified=ev_ver,
+                is_hr_authored=False,
+                status="APPROVED",
                 sequence=seq,
             )
             session.add(plan_q)
@@ -373,6 +410,8 @@ def _populate_round_questions(
                 question_type="SYSTEM_DESIGN",
                 purpose=purpose,
                 evidence_being_verified=ev_ver,
+                is_hr_authored=False,
+                status="APPROVED",
                 sequence=seq,
             )
             session.add(plan_q)
@@ -442,7 +481,7 @@ async def approve_interview_plan(
     plan = await get_interview_plan(session, organization_id, plan_id)
 
     if plan.status == "APPROVED":
-        return plan  # Idempotent approval
+        return plan
 
     if plan.status in {"SUPERSEDED", "REJECTED"}:
         raise InvalidPlanStateError(f"Cannot approve an interview plan with status '{plan.status}'.")
@@ -466,35 +505,73 @@ async def update_interview_plan(
     updated_by: UUID | None = None,
 ) -> InterviewPlan:
     """
-    Allows HR user to edit rounds, objectives, durations, and questions on a draft plan.
-    If the plan is already APPROVED, editing is rejected (an approved plan must be versioned/regenerated).
+    Allows HR user to edit rounds, objectives, durations, criteria, and questions.
+    - Checks lock_version for optimistic concurrency conflict prevention.
+    - If plan is in DRAFT state: updates in place and increments lock_version.
+    - If plan is in APPROVED state: creates a new DRAFT plan version (version + 1),
+      preserving the original approved version immutably for existing scheduled/completed interviews.
     """
     plan = await get_interview_plan(session, organization_id, plan_id)
 
+    # Optimistic concurrency check
+    if data.lock_version is not None and plan.lock_version != data.lock_version:
+        raise ConcurrentUpdateError(
+            f"Conflict: The interview plan has been modified by another session (expected lock_version {plan.lock_version}, got {data.lock_version}). Please refresh and try again."
+        )
+
     if plan.status == "APPROVED":
-        raise InvalidPlanStateError("Cannot modify an already approved interview plan. Please regenerate a new version.")
+        # Fork a new version to preserve the approved plan version immutably
+        version_stmt = select(func.max(InterviewPlan.version)).where(
+            InterviewPlan.application_id == plan.application_id
+        )
+        max_ver = await session.scalar(version_stmt) or plan.version
+        new_version = max_ver + 1
 
-    if data.hr_feedback is not None:
-        plan.hr_feedback = data.hr_feedback
+        new_plan = InterviewPlan(
+            id=uuid4(),
+            organization_id=organization_id,
+            application_id=plan.application_id,
+            job_id=plan.job_id,
+            dataset_file_id=plan.dataset_file_id,
+            version=new_version,
+            lock_version=1,
+            status="DRAFT",
+            candidate_strengths_summary=plan.candidate_strengths_summary,
+            verification_targets_summary=plan.verification_targets_summary,
+            hr_feedback=data.hr_feedback if data.hr_feedback is not None else plan.hr_feedback,
+            created_by=updated_by or plan.created_by,
+        )
+        session.add(new_plan)
+        target_plan = new_plan
+    else:
+        # Update draft in place
+        if data.hr_feedback is not None:
+            plan.hr_feedback = data.hr_feedback
+        plan.lock_version += 1
+        plan.rounds.clear()
+        await session.flush()
+        target_plan = plan
 
-    # Replace rounds & questions with updated values
-    plan.rounds.clear()
-    await session.flush()
-
+    # Re-populate rounds & questions
     for r_idx, r_data in enumerate(data.rounds, start=1):
         round_obj = InterviewPlanRound(
             id=uuid4(),
-            plan_id=plan.id,
+            plan_id=target_plan.id,
             round_number=r_data.round_number or r_idx,
             title=r_data.title,
             objective=r_data.objective,
+            description=r_data.description,
             concepts=r_data.concepts,
+            evaluation_criteria=r_data.evaluation_criteria,
+            expected_evidence=r_data.expected_evidence,
+            question_generation_mode=r_data.question_generation_mode or "AI_GENERATED",
+            difficulty=r_data.difficulty or "MEDIUM",
             estimated_duration_minutes=r_data.estimated_duration_minutes,
             required=r_data.required,
             reasoning=r_data.reasoning,
             sequence=r_idx,
         )
-        plan.rounds.append(round_obj)
+        target_plan.rounds.append(round_obj)
 
         for q_idx, q_data in enumerate(r_data.questions, start=1):
             q_obj = InterviewPlanQuestion(
@@ -507,11 +584,211 @@ async def update_interview_plan(
                 question_type=q_data.question_type,
                 purpose=q_data.purpose,
                 evidence_being_verified=q_data.evidence_being_verified,
+                is_hr_authored=q_data.is_hr_authored,
+                status=q_data.status or "APPROVED",
                 sequence=q_idx,
             )
             round_obj.questions.append(q_obj)
 
-    target_plan_id = plan.id
-    plan.updated_at = datetime.utcnow()
+    target_plan.updated_at = datetime.utcnow()
     await session.commit()
-    return await get_interview_plan(session, organization_id, target_plan_id)
+    return await get_interview_plan(session, organization_id, target_plan.id)
+
+
+async def preview_or_generate_round_questions(
+    session: AsyncSession,
+    application_id: UUID,
+    organization_id: UUID,
+    request: RoundQuestionGeneratePreviewRequest,
+) -> list[InterviewPlanQuestionSchema]:
+    """
+    Generates previewable question proposals for a round based on:
+    - Mode: AI_GENERATED (all generated), HR_DEFINED (only HR questions), HYBRID (preserve HR + generate remaining)
+    - Grounding: Round concepts, difficulty, expected evidence, criteria, and candidate evidence gap analysis.
+    - Safety: Respects untrusted data constraints and never replaces HR-authored questions silently.
+    """
+    mode = request.question_generation_mode.upper()
+    results: list[InterviewPlanQuestionSchema] = []
+
+    # 1. Mode: HR_DEFINED -> strictly use HR-authored questions
+    if mode == "HR_DEFINED":
+        for idx, q in enumerate(request.hr_questions, start=1):
+            q_copy = q.model_copy()
+            q_copy.sequence = idx
+            q_copy.is_hr_authored = True
+            q_copy.status = "APPROVED"
+            results.append(q_copy)
+        return results
+
+    # 2. Mode: HYBRID -> preserve existing HR-authored questions first
+    if mode == "HYBRID":
+        for idx, q in enumerate(request.hr_questions, start=1):
+            q_copy = q.model_copy()
+            q_copy.sequence = idx
+            q_copy.is_hr_authored = True
+            q_copy.status = "APPROVED"
+            results.append(q_copy)
+
+    # Calculate remaining questions needed
+    needed_count = max(1, request.target_count - len(results))
+    existing_texts = {q.question_text.lower().strip() for q in results}
+
+    # Fetch candidate pre-analysis for targeted evidence probing
+    try:
+        pre_analysis = await build_candidate_interview_pre_analysis(
+            session=session,
+            application_id=application_id,
+            organization_id=organization_id,
+        )
+        claims_set = {c["capability_name"].lower() for c in pre_analysis.candidate_claims}
+        unknown_set = {u["capability_name"].lower() for u in pre_analysis.candidate_unknowns}
+    except Exception:
+        claims_set = set()
+        unknown_set = set()
+
+    concepts = request.concepts if request.concepts else ["Core Fundamentals"]
+    seq_start = len(results) + 1
+
+    # Attempt AI question generation via LLM if available, else high-quality deterministic synthesis
+    generated_questions: list[InterviewPlanQuestionSchema] = []
+    if settings.groq_api_key and not settings.groq_api_key.startswith("your_"):
+        try:
+            llm_questions = await _llm_generate_round_questions(
+                round_title=request.round_title,
+                objective=request.objective,
+                concepts=concepts,
+                difficulty=request.difficulty,
+                evaluation_criteria=request.evaluation_criteria,
+                expected_evidence=request.expected_evidence,
+                count=needed_count,
+            )
+            for lq in llm_questions:
+                if lq.question_text.lower().strip() not in existing_texts:
+                    generated_questions.append(lq)
+                    existing_texts.add(lq.question_text.lower().strip())
+                    if len(generated_questions) >= needed_count:
+                        break
+        except Exception as e:
+            logger.warning(f"Groq question generation failed ({e}), falling back to grounded synthesis")
+
+    # If LLM didn't produce enough questions, synthesize grounded questions
+    for concept in concepts:
+        if len(generated_questions) >= needed_count:
+            break
+        c_lower = concept.lower()
+
+        if c_lower in claims_set:
+            purpose = f"Validate resume claim on {concept} through production scenarios"
+            ev_ver = f"{concept} (CLAIM)"
+        elif c_lower in unknown_set:
+            purpose = f"Probe foundational understanding and unverified capabilities in {concept}"
+            ev_ver = f"{concept} (UNKNOWN)"
+        else:
+            purpose = f"Evaluate technical depth and implementation trade-offs in {concept}"
+            ev_ver = f"{concept}"
+
+        if request.difficulty.upper() == "HARD":
+            text = f"Describe an instance where you optimized or diagnosed a bottleneck in {concept}. What trade-offs were made, and how did you verify the solution in production?"
+            q_type = "SYSTEM_DESIGN"
+        elif request.difficulty.upper() == "EASY":
+            text = f"What are the foundational principles and standard design patterns associated with {concept} in modern software systems?"
+            q_type = "CONCEPTUAL"
+        else:
+            text = f"Explain the architectural patterns, trade-offs, and practical design decisions you employ with {concept} in high-reliability applications."
+            q_type = "PRACTICAL"
+
+        if text.lower().strip() not in existing_texts:
+            generated_questions.append(
+                InterviewPlanQuestionSchema(
+                    question_text=text,
+                    concept=concept,
+                    difficulty=request.difficulty.upper(),
+                    question_type=q_type,
+                    purpose=purpose,
+                    evidence_being_verified=ev_ver,
+                    is_hr_authored=False,
+                    status="APPROVED",
+                    sequence=seq_start + len(generated_questions),
+                )
+            )
+            existing_texts.add(text.lower().strip())
+
+    results.extend(generated_questions)
+    for idx, q in enumerate(results, start=1):
+        q.sequence = idx
+
+    return results
+
+
+async def _llm_generate_round_questions(
+    round_title: str,
+    objective: str,
+    concepts: list[str],
+    difficulty: str,
+    evaluation_criteria: list[str],
+    expected_evidence: list[str],
+    count: int,
+) -> list[InterviewPlanQuestionSchema]:
+    """Generates structured questions via Groq with strict JSON output."""
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.groq_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    system_prompt = """You are an expert technical hiring manager at Gap2Hire.
+Generate focused, probing technical interview questions aligned to the specified round configuration.
+Never invent candidate facts.
+Output strictly valid JSON:
+{
+  "questions": [
+    {
+      "question_text": "...",
+      "concept": "...",
+      "difficulty": "EASY | MEDIUM | HARD",
+      "question_type": "CONCEPTUAL | PRACTICAL | SYSTEM_DESIGN",
+      "purpose": "What technical competency or claim this question verifies",
+      "evidence_being_verified": "Concrete evidence expected"
+    }
+  ]
+}"""
+
+    user_prompt = f"""Round Title: {round_title}
+Objective: {objective}
+Concepts: {', '.join(concepts)}
+Configured Difficulty: {difficulty}
+Evaluation Criteria: {json.dumps(evaluation_criteria)}
+Expected Evidence: {json.dumps(expected_evidence)}
+Generate {count} distinct technical questions that evaluate these competencies."""
+
+    payload = {
+        "model": settings.groq_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        res = await client.post(url, headers=headers, json=payload)
+        if res.status_code != 200:
+            raise RuntimeError(f"Groq API returned {res.status_code}")
+        data = res.json()
+        raw_json = json.loads(data["choices"][0]["message"]["content"])
+        qs = []
+        for item in raw_json.get("questions", []):
+            qs.append(
+                InterviewPlanQuestionSchema(
+                    question_text=item.get("question_text", ""),
+                    concept=item.get("concept", concepts[0] if concepts else "Engineering"),
+                    difficulty=item.get("difficulty", difficulty),
+                    question_type=item.get("question_type", "CONCEPTUAL"),
+                    purpose=item.get("purpose", f"Assess {concepts[0] if concepts else 'competency'}"),
+                    evidence_being_verified=item.get("evidence_being_verified", concepts[0] if concepts else "Skills"),
+                    is_hr_authored=False,
+                    status="APPROVED",
+                )
+            )
+        return qs

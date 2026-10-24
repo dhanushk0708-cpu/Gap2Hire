@@ -164,6 +164,19 @@ class InterviewReport(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
+    # Enhanced Phase 11 fields for completion, duration & AV monitoring
+    completion_reason: str | None = None
+    configured_duration_minutes: int | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    plan_version: int | None = None
+    transcript: list[dict[str, Any]] = Field(default_factory=list)
+    unanswered_questions: list[dict[str, Any]] = Field(default_factory=list)
+    media_events: list[dict[str, Any]] = Field(default_factory=list)
+    scorecard_data: dict[str, Any] | None = None
+    failure_reason: str | None = None
+    report_status: str | None = None
+
     # Backwards-compatibility aliases
     pre_interview_analysis: PreInterviewAnalysis | None = None
     evidence_observations: list[dict[str, Any]] = Field(default_factory=list)

@@ -20,6 +20,8 @@ from app.models.interview_plan import (
 from app.models.interview_answer_analysis import InterviewAnswerAnalysis
 from app.models.interview_integrity import InterviewIntegrityEvent
 from app.models.interview_schedule import InterviewSchedule
+from app.models.interview_booking_slot import InterviewBookingSlot
+from app.models.simulated_notification import SimulatedNotification
 from app.models.interview_report import InterviewReportModel
 from app.models.candidate_hiring_decision import CandidateHiringDecision
 from app.models.candidate_scorecard import CandidateScorecard
@@ -43,6 +45,7 @@ __all__ = [
     "EmailConnection",
     "Evidence",
     "ImportedEmail",
+    "InterviewBookingSlot",
     "InterviewDatasetFile",
     "InterviewDatasetQuestion",
     "InterviewAnswerAnalysis",
@@ -65,6 +68,7 @@ __all__ = [
     "ResearchCapabilityState",
     "ResearchEvent",
     "ResearchSession",
+    "SimulatedNotification",
     "User",
     "Verification",
 ]

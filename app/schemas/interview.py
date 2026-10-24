@@ -57,10 +57,20 @@ class InterviewSessionResponse(BaseModel):
     current_capability_id: UUID | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
+    duration_minutes: int = 30
+    deadline_at: datetime | None = None
+    completion_reason: str | None = None
+    report_status: str = "NOT_STARTED"
+    remaining_seconds: int | None = None
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class InterviewStartRequest(BaseModel):
+    duration_minutes: int | None = None
+    media_verified: bool = True
 
 
 class InterviewSessionDetailResponse(InterviewSessionResponse):

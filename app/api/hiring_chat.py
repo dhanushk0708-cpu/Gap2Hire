@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.authorization import require_roles
+from app.core.roles import UserRole
 from app.db.session import get_db_session
 from app.models.user import User
 from app.schemas.hiring_chat import (
@@ -29,7 +30,12 @@ router = APIRouter(
     tags=["Hiring Intelligence Chat"],
 )
 
-_require_manager = require_roles("HR_MANAGER", "ADMIN", "application_manager")
+require_hr = require_roles(
+    UserRole.COMPANY_ADMIN,
+    UserRole.RECRUITER,
+    UserRole.HIRING_MANAGER,
+)
+_require_manager = require_hr
 
 
 @router.post(

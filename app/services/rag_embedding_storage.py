@@ -23,6 +23,7 @@ from app.services.embedding_service import (
     EmbeddingProvider,
     EmbeddingServiceError,
     MockEmbeddingProvider,
+    SentenceTransformerEmbeddingProvider,
     get_embedding_provider,
     validate_embedding_vector,
 )
@@ -195,14 +196,24 @@ async def sync_embeddings(
         return sync_result
 
     # 3. Generate embeddings for changed/new items
-    for item, existing, content_hash in to_embed:
-        try:
-            raw_vec = active_provider.embed_text(item.text)
-            validated_vec = validate_embedding_vector(raw_vec, active_provider.dimension)
-        except EmbeddingServiceError as exc:
-            logger.error("Embedding generation failed for chunk %s: %s", item.chunk_id, exc)
-            raise EmbeddingSyncError(f"Embedding generation failed for chunk {item.chunk_id}: {exc}") from exc
+    texts_to_embed = [item.text for item, _, _ in to_embed]
+    try:
+        if isinstance(active_provider, (SentenceTransformerEmbeddingProvider, MockEmbeddingProvider)):
+            raw_vectors = active_provider.embed_batch(texts_to_embed)
+            validated_vectors = [
+                validate_embedding_vector(v, active_provider.dimension)
+                for v in raw_vectors
+            ]
+        else:
+            validated_vectors = [
+                validate_embedding_vector(active_provider.embed_text(item.text), active_provider.dimension)
+                for item, _, _ in to_embed
+            ]
+    except (EmbeddingServiceError, Exception) as exc:
+        logger.error("Embedding generation failed: %s", exc)
+        raise EmbeddingSyncError(f"Embedding generation failed: {exc}") from exc
 
+    for (item, existing, content_hash), validated_vec in zip(to_embed, validated_vectors):
         if existing is not None:
             # Update existing row
             existing.chunk_text = item.text

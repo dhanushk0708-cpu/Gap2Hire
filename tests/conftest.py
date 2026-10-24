@@ -19,3 +19,13 @@ def default_mock_embedding_provider():
     set_embedding_provider(MockEmbeddingProvider(dimension=384))
     yield
     set_embedding_provider(None)
+
+
+@pytest.fixture(autouse=True)
+def mock_langgraph_checkpointer_pool():
+    """
+    Prevents LangGraph checkpointer from attempting connection to PostgreSQL during unit tests.
+    """
+    from unittest.mock import AsyncMock, patch
+    with patch("app.services.interview_graph.start_or_resume_interview_graph", new=AsyncMock()):
+        yield

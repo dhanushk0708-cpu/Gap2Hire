@@ -2223,10 +2223,11 @@ class TestStage4Integration:
     async def test_stage4_sync_index_endpoint_authorized(self):
         """Authorized HR manager can trigger tenant index synchronization."""
         from app.api.hiring_chat import sync_tenant_rag_index_endpoint
+        from app.core.roles import UserRole
         from app.services.rag_embedding_storage import SyncResult
 
         org_id = uuid4()
-        user_mgr = MagicMock(role="HR_MANAGER", organization_id=org_id)
+        user_mgr = MagicMock(role=UserRole.RECRUITER.value, organization_id=org_id)
         session = AsyncMock()
 
         mock_sync_result = SyncResult(created=3, updated=1, unchanged=5, total_processed=9)
@@ -2248,9 +2249,10 @@ class TestStage4Integration:
     async def test_stage4_sync_index_endpoint_failure_rollback(self):
         """Index synchronization failure safely rolls back session and raises 500."""
         from app.api.hiring_chat import sync_tenant_rag_index_endpoint
+        from app.core.roles import UserRole
         from fastapi import HTTPException
 
-        user_mgr = MagicMock(role="HR_MANAGER", organization_id=uuid4())
+        user_mgr = MagicMock(role=UserRole.COMPANY_ADMIN.value, organization_id=uuid4())
         session = AsyncMock()
 
         with patch("app.api.hiring_chat.sync_tenant_rag_index", side_effect=RuntimeError("Database lock")):
@@ -2259,6 +2261,61 @@ class TestStage4Integration:
             assert exc_info.value.status_code == 500
             assert "Index synchronization failed" in exc_info.value.detail
             session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("allowed_role", [
+        "COMPANY_ADMIN",
+        "RECRUITER",
+        "HIRING_MANAGER",
+    ])
+    async def test_hireiq_chat_authorization_allows_hr_roles(self, allowed_role: str):
+        """COMPANY_ADMIN, RECRUITER, and HIRING_MANAGER are authorized for HR hiring chat and sync-index."""
+        from app.api.hiring_chat import require_hr
+        from app.core.roles import UserRole
+        from fastapi import HTTPException
+
+        # Mock User object with role as enum or string
+        user = MagicMock()
+        user.role = allowed_role
+        user.organization_id = uuid4()
+
+        # Execute dependency checker directly with mock user
+        # Note: require_hr returns role_checker function
+        checker = require_hr
+
+        # Test with string role
+        passed_user = await checker(current_user=user)
+        assert passed_user.role == allowed_role
+
+        # Test with UserRole enum instance
+        user.role = UserRole(allowed_role)
+        passed_user_enum = await checker(current_user=user)
+        assert passed_user_enum.role == UserRole(allowed_role)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unauthorized_role", [
+        "CANDIDATE",
+        "PLATFORM_ADMIN",
+        "INTERVIEWER",
+        "HR_MANAGER",
+        "ADMIN",
+        "unknown_role",
+    ])
+    async def test_hireiq_chat_authorization_rejects_unauthorized_roles(self, unauthorized_role: str):
+        """CANDIDATE, PLATFORM_ADMIN, and non-HR roles receive 403 Forbidden."""
+        from app.api.hiring_chat import require_hr
+        from fastapi import HTTPException
+
+        user = MagicMock()
+        user.role = unauthorized_role
+        user.organization_id = uuid4()
+
+        checker = require_hr
+        with pytest.raises(HTTPException) as exc_info:
+            await checker(current_user=user)
+
+        assert exc_info.value.status_code == 403
+        assert "You do not have permission" in exc_info.value.detail
 
     @pytest.mark.asyncio
     async def test_stage4_prior_history_not_treated_as_verified_evidence(self):

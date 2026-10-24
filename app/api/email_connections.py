@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.authorization import require_roles
 from app.core.roles import UserRole
 from app.db.session import get_db_session
+from app.models.email_connection import EmailConnection
 from app.models.user import User
 from app.schemas.email_integration import (
     BatchEmailSyncResponse,
@@ -46,12 +47,35 @@ async def load_new_resumes_endpoint(
     session: AsyncSession = Depends(get_db_session),
 ):
     """Company-level 'LOAD NEW RESUMES' action. Synchronizes a bounded batch of emails and executes candidate intake."""
-    return await batch_sync_emails(
-        session=session,
-        organization_id=current_user.organization_id,
-        limit=limit,
-        target_job_id=target_job_id,
-    )
+    try:
+        return await batch_sync_emails(
+            session=session,
+            organization_id=current_user.organization_id,
+            limit=limit,
+            target_job_id=target_job_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        from app.services.gmail_provider import GmailAuthenticationError, GmailSyncError
+
+        if isinstance(exc, GmailAuthenticationError):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        elif isinstance(exc, GmailSyncError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Email sync failed: {exc}",
+        ) from exc
 
 
 @router.post(
@@ -139,10 +163,22 @@ async def get_google_oauth_url_endpoint(
     state: str = "",
     current_user: User = Depends(require_hr),
 ):
-    """Generates the Google OAuth authorization URL for connecting Gmail."""
+    """Generates the Google OAuth authorization URL for connecting Gmail with CSRF state token."""
+    from app.core.security import generate_oauth_state
     from app.services.gmail_provider import get_google_auth_url
-    url = get_google_auth_url(state=state or str(current_user.organization_id))
-    return {"authorization_url": url}
+
+    try:
+        oauth_state = generate_oauth_state(
+            organization_id=current_user.organization_id,
+            user_id=current_user.id,
+        )
+        url = get_google_auth_url(state=oauth_state)
+        return {"authorization_url": url}
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get(
@@ -156,90 +192,181 @@ async def google_oauth_callback_endpoint(
     state: str = "",
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Handles the Google OAuth redirect callback, exchanges token, and saves the Gmail connection."""
-    import json
+    """Handles Google OAuth callback, validates CSRF state, exchanges tokens, encrypts payload, and marks connection ACTIVE."""
+    from datetime import datetime
+    from app.core.config import settings
+    from app.core.security import encrypt_auth_payload, validate_oauth_state
     from app.models.organization import Organization
     from app.services.gmail_provider import exchange_google_code_for_tokens
     from fastapi.responses import HTMLResponse
 
+    accept_header = request.headers.get("accept", "")
+    is_browser = "text/html" in accept_header
+
+    # Validate state to prevent CSRF and isolate to authenticating organization
+    try:
+        state_payload = validate_oauth_state(state)
+        org_id = UUID(state_payload["org_id"])
+    except Exception as exc:
+        if is_browser:
+            return HTMLResponse(
+                content=f"""
+                <!DOCTYPE html>
+                <html><head><title>OAuth Failed</title></head>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh;">
+                  <div style="text-align: center; max-width: 450px; padding: 2rem; border: 1px solid #FCA5A5; border-radius: 8px; background: #FEF2F2;">
+                    <h2 style="color: #991B1B;">OAuth Authorization Failed</h2>
+                    <p style="color: #7F1D1D;">Invalid or expired CSRF state. {exc}</p>
+                    <a href="{settings.frontend_url.rstrip('/')}/settings/email" style="display: inline-block; margin-top: 1rem; color: #2563EB;">Return to Email Settings</a>
+                  </div>
+                </body></html>
+                """,
+                status_code=400,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSRF state validation failed: {exc}",
+        ) from exc
+
+    org = await session.get(Organization, org_id)
+    if not org:
+        stmt = select(Organization).where(Organization.id == org_id)
+        org = await session.scalar(stmt)
+    if not org:
+        if is_browser:
+            return HTMLResponse(
+                content=f"""
+                <!DOCTYPE html>
+                <html><head><title>Organization Not Found</title></head>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh;">
+                  <div style="text-align: center; max-width: 450px; padding: 2rem; border: 1px solid #FCA5A5; border-radius: 8px; background: #FEF2F2;">
+                    <h2 style="color: #991B1B;">Organization Not Found</h2>
+                    <p style="color: #7F1D1D;">Organization {org_id} associated with this OAuth session was not found.</p>
+                    <a href="{settings.frontend_url.rstrip('/')}/settings/email" style="display: inline-block; margin-top: 1rem; color: #2563EB;">Return to Email Settings</a>
+                  </div>
+                </body></html>
+                """,
+                status_code=404,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Target organization not found.",
+        )
+
     try:
         token_data = await exchange_google_code_for_tokens(code)
     except Exception as exc:
+        if is_browser:
+            return HTMLResponse(
+                content=f"""
+                <!DOCTYPE html>
+                <html><head><title>Token Exchange Failed</title></head>
+                <body style="font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh;">
+                  <div style="text-align: center; max-width: 450px; padding: 2rem; border: 1px solid #FCA5A5; border-radius: 8px; background: #FEF2F2;">
+                    <h2 style="color: #991B1B;">Token Exchange Failed</h2>
+                    <p style="color: #7F1D1D;">{exc}</p>
+                    <a href="{settings.frontend_url.rstrip('/')}/settings/email" style="display: inline-block; margin-top: 1rem; color: #2563EB;">Return to Email Settings</a>
+                  </div>
+                </body></html>
+                """,
+                status_code=400,
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Google OAuth token exchange failed: {exc}",
         ) from exc
 
-    # Resolve organization from state or fallback to default
-    org_id = None
-    if state:
-        try:
-            org_id = UUID(state)
-        except Exception:
-            pass
+    account_email = token_data.get("account_email", "connected-gmail@gap2hire.com")
+    encrypted_tokens = encrypt_auth_payload({
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_in": token_data.get("expires_in"),
+        "token_type": token_data.get("token_type", "Bearer"),
+        "scope": token_data.get("scope"),
+    })
 
-    if not org_id:
-        org_stmt = select(Organization).limit(1)
-        org = await session.scalar(org_stmt)
-        if org:
-            org_id = org.id
-
-    if not org_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not determine organization for OAuth connection.",
+    # Search for an existing Gmail connection for this tenant organization
+    stmt = (
+        select(EmailConnection)
+        .where(
+            EmailConnection.organization_id == org_id,
+            EmailConnection.provider == "GMAIL",
         )
-
-    # Save connection
-    conn_data = EmailConnectionCreate(
-        provider="GMAIL",
-        account_email=token_data.get("account_email", "connected-gmail@gap2hire.com"),
-        status="ACTIVE",
-        auth_payload_encrypted=json.dumps({
-            "access_token": token_data.get("access_token"),
-            "refresh_token": token_data.get("refresh_token"),
-            "expires_in": token_data.get("expires_in"),
-        }),
+        .order_by(EmailConnection.created_at.desc())
     )
+    existing_conn = await session.scalar(stmt)
 
-    created_conn = await create_email_connection(
-        session=session,
-        organization_id=org_id,
-        data=conn_data,
-    )
+    if existing_conn:
+        existing_conn.account_email = account_email.strip().lower()
+        existing_conn.status = "ACTIVE"
+        existing_conn.auth_payload_encrypted = encrypted_tokens
+        existing_conn.updated_at = datetime.utcnow()
+        await session.commit()
+        await session.refresh(existing_conn)
+        conn_record = existing_conn
+    else:
+        conn_record = EmailConnection(
+            organization_id=org_id,
+            provider="GMAIL",
+            account_email=account_email.strip().lower(),
+            status="ACTIVE",
+            auth_payload_encrypted=encrypted_tokens,
+        )
+        session.add(conn_record)
+        await session.commit()
+        await session.refresh(conn_record)
 
-    # If redirected from a browser, display a success redirect page back to the app UI
-    accept_header = request.headers.get("accept", "")
-    if "text/html" in accept_header:
-        html_page = """
+    if is_browser:
+        redirect_url = f"{settings.frontend_url.rstrip('/')}/settings/email?gmail_connected=true"
+        html_page = f"""
         <!DOCTYPE html>
         <html>
         <head>
             <title>Gmail Connected - Gap2Hire</title>
-            <meta http-equiv="refresh" content="2;url=http://localhost:5173/screening?gmail_connected=true" />
+            <meta http-equiv="refresh" content="2;url={redirect_url}" />
             <style>
-                body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8FAFC; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-                .card { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 36px 48px; text-align: center; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); max-width: 440px; }
-                .icon { width: 52px; height: 52px; border-radius: 50%; background: #DCFCE7; color: #16A34A; display: inline-flex; align-items: center; justify-content: center; font-size: 26px; margin: 0 auto 16px auto; }
-                h2 { color: #0F172A; font-size: 20px; font-weight: 600; margin: 0 0 8px 0; }
-                p { color: #64748B; font-size: 14px; margin: 0 0 24px 0; line-height: 1.5; }
-                .btn { display: inline-block; background: #2563EB; color: #FFFFFF; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s; }
-                .btn:hover { background: #1D4ED8; }
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #F8FAFC; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+                .card {{ background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 12px; padding: 36px 48px; text-align: center; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.05); max-width: 440px; }}
+                .icon {{ width: 52px; height: 52px; border-radius: 50%; background: #DCFCE7; color: #16A34A; display: inline-flex; align-items: center; justify-content: center; font-size: 26px; margin: 0 auto 16px auto; }}
+                h2 {{ color: #0F172A; font-size: 20px; font-weight: 600; margin: 0 0 8px 0; }}
+                p {{ color: #64748B; font-size: 14px; margin: 0 0 24px 0; line-height: 1.5; }}
+                .btn {{ display: inline-block; background: #2563EB; color: #FFFFFF; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; text-decoration: none; transition: background 0.15s; }}
+                .btn:hover {{ background: #1D4ED8; }}
             </style>
         </head>
         <body>
             <div class="card">
                 <div class="icon">✓</div>
                 <h2>Gmail Connected Successfully!</h2>
-                <p>Your Gmail account has been securely linked to Gap2Hire. Redirecting you to the Screening Queue...</p>
-                <a class="btn" href="http://localhost:5173/screening?gmail_connected=true">Continue to Screening Queue</a>
+                <p>Your Gmail account (<strong>{account_email}</strong>) has been securely linked to Gap2Hire with active status.</p>
+                <a class="btn" href="{redirect_url}">Continue to Email Settings</a>
             </div>
         </body>
         </html>
         """
         return HTMLResponse(content=html_page)
 
-    return created_conn
+    return conn_record
+
+
+@email_router.get(
+    "/oauth/callback",
+    response_model=EmailConnectionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def email_oauth_callback_alias(
+    request: Request,
+    code: str,
+    state: str = "",
+    session: AsyncSession = Depends(get_db_session),
+):
+    """Alias for /api/v1/email/oauth/callback matching Google OAuth client credentials."""
+    return await google_oauth_callback_endpoint(
+        request=request,
+        code=code,
+        state=state,
+        session=session,
+    )
 
 
 @router.post(
@@ -267,13 +394,36 @@ async def sync_emails_endpoint(
             detail=str(e),
         ) from e
 
-    return await batch_sync_emails(
-        session=session,
-        organization_id=current_user.organization_id,
-        connection_id=connection_id,
-        limit=limit,
-        target_job_id=target_job_id,
-    )
+    try:
+        return await batch_sync_emails(
+            session=session,
+            organization_id=current_user.organization_id,
+            connection_id=connection_id,
+            limit=limit,
+            target_job_id=target_job_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        from app.services.gmail_provider import GmailAuthenticationError, GmailSyncError
+
+        if isinstance(exc, GmailAuthenticationError):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        elif isinstance(exc, GmailSyncError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Email sync failed: {exc}",
+        ) from exc
 
 
 @router.post(

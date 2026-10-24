@@ -164,7 +164,12 @@ class SentenceTransformerEmbeddingProvider:
                     "sentence-transformers is not installed in the current environment."
                 ) from exc
             logger.info("Loading SentenceTransformer model %s (device=cpu)", self._model_name)
-            self._model = SentenceTransformer(self._model_name, device="cpu")
+            try:
+                # Prioritize local cached files for fast sub-second startup without network roundtrips
+                self._model = SentenceTransformer(self._model_name, device="cpu", local_files_only=True)
+            except Exception:
+                # Fallback to standard online download if local cache is not present
+                self._model = SentenceTransformer(self._model_name, device="cpu")
         return self._model
 
     def embed_text(self, text: str) -> list[float]:

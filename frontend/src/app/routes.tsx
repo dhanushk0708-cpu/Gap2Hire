@@ -19,6 +19,8 @@ import { InterviewReportView } from '../features/interview-report/InterviewRepor
 import { AnalyticsView } from '../features/analytics/AnalyticsView';
 import { HiringIntelligenceView } from '../features/analytics/HiringIntelligenceView';
 import { EmailSettingsView } from '../features/settings/EmailSettingsView';
+import { InterviewSchedulerView } from '../features/interviews/InterviewSchedulerView';
+import { CandidateSelfBookingView } from '../features/interviews/CandidateSelfBookingView';
 import { Skeleton } from '../shared/components/Skeleton';
 
 // Protected Route wrapper checking authentication
@@ -62,6 +64,9 @@ export const AppRoutes: React.FC = () => {
       {/* Candidate Live Interview Room (standalone focused experience) */}
       <Route path="/interview-room/:sessionId" element={<CandidateLiveRoomView />} />
 
+      {/* Candidate Public Self-Booking Portal */}
+      <Route path="/book-interview/:bookingToken" element={<CandidateSelfBookingView />} />
+
       {/* Protected Enterprise SaaS App Layout */}
       <Route
         path="/"
@@ -80,6 +85,8 @@ export const AppRoutes: React.FC = () => {
         <Route path="screening" element={<ScreeningQueueView />} />
         <Route path="interview-datasets" element={<DatasetLibraryView />} />
         <Route path="candidates/:applicationId/interview-plan" element={<InterviewPlanView />} />
+        <Route path="interviews" element={<InterviewSchedulerView />} />
+        <Route path="interviews/schedule" element={<Navigate to="/interviews" replace />} />
         <Route path="interviews/:sessionId/observer" element={<HRLiveObserverView />} />
         <Route path="interviews/:sessionId/report" element={<InterviewReportView />} />
         <Route path="analytics" element={<AnalyticsView />} />

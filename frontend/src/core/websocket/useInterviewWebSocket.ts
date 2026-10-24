@@ -2,11 +2,30 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { getStoredToken } from '../api/client';
 import type { AvatarState, IntegrityAlert, IntegrityEventType, IntegrityObservationEvent, InterviewMessage } from '../types';
 
+export interface DurationDeadlinePayload {
+  remainingSeconds: number;
+  deadlineAt: string | null;
+  durationMinutes: number;
+}
+
+export interface CompletionStatePayload {
+  isCompleted: boolean;
+  reason: string;
+  message: string;
+  reportUrl: string;
+}
+
+export interface MediaWarningPayload {
+  warning: string;
+  recoverySeconds: number;
+}
+
 export interface UseInterviewWebSocketProps {
   sessionId: string;
   onAIMessage?: (content: string, targetCapability?: string) => void;
   onAIAudio?: (base64Audio: string, contentType: string) => void;
   onIntegrityObservation?: (event: IntegrityObservationEvent) => void;
+  onCompleted?: (completion: CompletionStatePayload) => void;
   onError?: (err: any) => void;
 }
 
@@ -15,6 +34,7 @@ export function useInterviewWebSocket({
   onAIMessage,
   onAIAudio,
   onIntegrityObservation,
+  onCompleted,
   onError,
 }: UseInterviewWebSocketProps) {
   const [isConnected, setIsConnected] = useState(false);
@@ -23,6 +43,10 @@ export function useInterviewWebSocket({
   const [currentAIQuestion, setCurrentAIQuestion] = useState<string | null>(null);
   const [currentCapability, setCurrentCapability] = useState<string | null>(null);
   const [activeAlert, setActiveAlert] = useState<IntegrityAlert | null>(null);
+  const [durationDeadline, setDurationDeadline] = useState<DurationDeadlinePayload | null>(null);
+  const [completionState, setCompletionState] = useState<CompletionStatePayload | null>(null);
+  const [mediaWarning, setMediaWarning] = useState<MediaWarningPayload | null>(null);
+  const [isWaitingForReadiness, setIsWaitingForReadiness] = useState<boolean>(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const isClosingExplicitly = useRef(false);
@@ -107,8 +131,33 @@ export function useInterviewWebSocket({
   onAIAudioRef.current = onAIAudio;
   const onIntegrityObservationRef = useRef(onIntegrityObservation);
   onIntegrityObservationRef.current = onIntegrityObservation;
+  const onCompletedRef = useRef(onCompleted);
+  onCompletedRef.current = onCompleted;
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+
+  // Send start interview event
+  const sendStartInterview = useCallback(
+    (durationMinutes: number, mediaVerified = true) => {
+      sendEvent({
+        type: 'start_interview',
+        duration_minutes: durationMinutes,
+        media_verified: mediaVerified,
+      });
+      setIsWaitingForReadiness(false);
+    },
+    [sendEvent]
+  );
+
+  // Send media recovery timeout notification
+  const sendMediaTimeout = useCallback(() => {
+    sendEvent({
+      type: 'integrity_event',
+      event_type: 'MEDIA_RECOVERY_FAILED',
+      occurred_at: new Date().toISOString(),
+      metadata: { note: 'Camera or microphone recovery timeout exceeded (30s)' },
+    });
+  }, [sendEvent]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -136,7 +185,34 @@ export function useInterviewWebSocket({
         const data = JSON.parse(event.data);
         console.log('[WS MESSAGE TYPE]:', data.type, data.event || '');
 
-        if (data.type === 'avatar_state' && data.state) {
+        if (data.type === 'duration_deadline') {
+          setDurationDeadline({
+            remainingSeconds: data.remaining_seconds,
+            deadlineAt: data.deadline_at,
+            durationMinutes: data.duration_minutes,
+          });
+        } else if (data.type === 'interview_completed') {
+          console.log('[WS INTERVIEW COMPLETED]:', data.reason);
+          const comp = {
+            isCompleted: true,
+            reason: data.reason || 'TIME_EXPIRED',
+            message: data.message || 'Interview time is over.',
+            reportUrl: data.report_url || `/interviews/${sessionId}/report`,
+          };
+          setCompletionState(comp);
+          onCompletedRef.current?.(comp);
+        } else if (data.type === 'media_warning') {
+          console.warn('[WS MEDIA WARNING]:', data.warning);
+          setMediaWarning({
+            warning: data.warning || 'Camera or microphone lost.',
+            recoverySeconds: data.recovery_timeout_seconds || data.recovery_seconds || 30,
+          });
+        } else if (data.type === 'media_restored') {
+          console.log('[WS MEDIA RESTORED]');
+          setMediaWarning(null);
+        } else if (data.type === 'system' && data.is_waiting_for_readiness) {
+          setIsWaitingForReadiness(true);
+        } else if (data.type === 'avatar_state' && data.state) {
           setAvatarState(data.state);
         } else if (data.type === 'ai_message') {
           console.log('[WS AI QUESTION]:', data.content);
@@ -217,6 +293,14 @@ export function useInterviewWebSocket({
     currentCapability,
     activeAlert,
     dismissAlert,
+    durationDeadline,
+    setDurationDeadline,
+    completionState,
+    mediaWarning,
+    setMediaWarning,
+    isWaitingForReadiness,
+    sendStartInterview,
+    sendMediaTimeout,
     sendCandidateMessage,
     sendCandidateAudio,
     sendIntegrityEvent,

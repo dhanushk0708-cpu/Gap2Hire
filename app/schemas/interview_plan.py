@@ -14,6 +14,8 @@ class InterviewPlanQuestionSchema(BaseModel):
     question_type: str = "CONCEPTUAL"
     purpose: str | None = None
     evidence_being_verified: str | None = None
+    is_hr_authored: bool = False
+    status: str = "APPROVED"
     sequence: int = 1
 
     model_config = ConfigDict(from_attributes=True)
@@ -24,7 +26,12 @@ class InterviewPlanRoundSchema(BaseModel):
     round_number: int
     title: str
     objective: str
-    concepts: list[str]
+    description: str | None = None
+    concepts: list[str] = Field(default_factory=list)
+    evaluation_criteria: list[str] = Field(default_factory=list)
+    expected_evidence: list[str] = Field(default_factory=list)
+    question_generation_mode: str = "AI_GENERATED"  # AI_GENERATED, HR_DEFINED, HYBRID
+    difficulty: str = "MEDIUM"
     estimated_duration_minutes: int = 30
     required: bool = True
     reasoning: str | None = None
@@ -40,6 +47,7 @@ class InterviewPlanResponse(BaseModel):
     job_id: UUID
     dataset_file_id: UUID | None = None
     version: int = 1
+    lock_version: int = 1
     status: str = "DRAFT"  # DRAFT, APPROVED, SUPERSEDED, REJECTED
     candidate_strengths_summary: str | None = None
     verification_targets_summary: str | None = None
@@ -61,7 +69,26 @@ class InterviewPlanCreateRequest(BaseModel):
 class InterviewPlanUpdateRequest(BaseModel):
     rounds: list[InterviewPlanRoundSchema]
     hr_feedback: str | None = None
+    lock_version: int | None = None  # Optimistic concurrency lock
 
 
 class InterviewPlanApprovalRequest(BaseModel):
     notes: str | None = None
+
+
+class RoundQuestionGeneratePreviewRequest(BaseModel):
+    round_title: str
+    objective: str
+    description: str | None = None
+    concepts: list[str] = Field(default_factory=list)
+    evaluation_criteria: list[str] = Field(default_factory=list)
+    expected_evidence: list[str] = Field(default_factory=list)
+    difficulty: str = "MEDIUM"
+    duration_minutes: int = 30
+    question_generation_mode: str = "AI_GENERATED"  # AI_GENERATED, HR_DEFINED, HYBRID
+    hr_questions: list[InterviewPlanQuestionSchema] = Field(default_factory=list)
+    target_count: int = 3
+
+
+class RoundReorderRequest(BaseModel):
+    round_ids: list[UUID]

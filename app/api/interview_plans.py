@@ -16,15 +16,18 @@ from app.schemas.interview_plan import (
     InterviewPlanResponse,
     InterviewPlanRoundSchema,
     InterviewPlanUpdateRequest,
+    RoundQuestionGeneratePreviewRequest,
 )
 from app.services.application import ApplicationNotFoundError
 from app.services.interview_plan import (
+    ConcurrentUpdateError,
     InterviewPlanNotFoundError,
     InvalidPlanStateError,
     approve_interview_plan,
     generate_candidate_interview_plan,
     get_interview_plan,
     list_candidate_interview_plans,
+    preview_or_generate_round_questions,
     update_interview_plan,
 )
 from app.services.interview_pre_analysis import build_candidate_interview_pre_analysis
@@ -117,6 +120,34 @@ async def list_candidate_interview_plans_endpoint(
     return [_format_plan_response(p) for p in plans]
 
 
+@router.post(
+    "/api/v1/applications/{application_id}/interview/plans/preview-questions",
+    response_model=list[InterviewPlanQuestionSchema],
+    status_code=status.HTTP_200_OK,
+)
+async def preview_round_questions_endpoint(
+    application_id: UUID,
+    request: RoundQuestionGeneratePreviewRequest,
+    current_user: User = Depends(require_hr),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Previews AI-generated, HR-defined, or hybrid questions for a round configuration before saving.
+    """
+    try:
+        return await preview_or_generate_round_questions(
+            session=session,
+            application_id=application_id,
+            organization_id=current_user.organization_id,
+            request=request,
+        )
+    except ApplicationNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
 @router.get(
     "/api/v1/interview-plans/{plan_id}",
     response_model=InterviewPlanResponse,
@@ -153,7 +184,11 @@ async def update_interview_plan_endpoint(
     current_user: User = Depends(require_hr),
     session: AsyncSession = Depends(get_db_session),
 ):
-    """Allows HR user to edit rounds, objectives, and questions on a draft plan."""
+    """
+    Allows HR user to edit rounds, objectives, criteria, and questions on a plan.
+    - Protected by optimistic concurrency lock_version check (returns 409 Conflict if stale).
+    - If modifying an approved plan, automatically versions to a new DRAFT preserving the approved version.
+    """
     try:
         plan = await update_interview_plan(
             session=session,
@@ -166,6 +201,11 @@ async def update_interview_plan_endpoint(
     except InterviewPlanNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except ConcurrentUpdateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         ) from e
     except InvalidPlanStateError as e:
@@ -221,6 +261,8 @@ def _format_plan_response(plan: Any) -> InterviewPlanResponse:
                 question_type=q.question_type,
                 purpose=q.purpose,
                 evidence_being_verified=q.evidence_being_verified,
+                is_hr_authored=getattr(q, "is_hr_authored", False),
+                status=getattr(q, "status", "APPROVED"),
                 sequence=q.sequence,
             )
             for q in r.questions
@@ -231,7 +273,12 @@ def _format_plan_response(plan: Any) -> InterviewPlanResponse:
                 round_number=r.round_number,
                 title=r.title,
                 objective=r.objective,
-                concepts=r.concepts,
+                description=getattr(r, "description", None),
+                concepts=r.concepts or [],
+                evaluation_criteria=getattr(r, "evaluation_criteria", []) or [],
+                expected_evidence=getattr(r, "expected_evidence", []) or [],
+                question_generation_mode=getattr(r, "question_generation_mode", "AI_GENERATED"),
+                difficulty=getattr(r, "difficulty", "MEDIUM"),
                 estimated_duration_minutes=r.estimated_duration_minutes,
                 required=r.required,
                 reasoning=r.reasoning,
@@ -246,6 +293,7 @@ def _format_plan_response(plan: Any) -> InterviewPlanResponse:
         job_id=plan.job_id,
         dataset_file_id=plan.dataset_file_id,
         version=plan.version,
+        lock_version=getattr(plan, "lock_version", 1),
         status=plan.status,
         candidate_strengths_summary=plan.candidate_strengths_summary,
         verification_targets_summary=plan.verification_targets_summary,

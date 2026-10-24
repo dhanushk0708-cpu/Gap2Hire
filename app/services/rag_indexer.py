@@ -70,19 +70,52 @@ class RagRetrievalError(Exception):
 # Text and Scoring Utilities
 # ---------------------------------------------------------------------------
 
+_STOP = {
+    "the", "a", "an", "is", "in", "of", "to", "and", "or", "for",
+    "with", "on", "at", "by", "from", "that", "this", "it", "be",
+    "was", "are", "were", "has", "have", "had", "not", "but", "as",
+    "what", "how", "when", "which", "who", "did", "do", "does",
+    "can", "could", "will", "would", "should", "about", "tell", "me",
+    "any", "there", "their", "they", "them", "we", "us", "our",
+    "you", "your", "all", "also", "if",
+}
+
+_HIRING_SYNONYMS = {
+    "capablity": "capability",
+    "capablities": "capability",
+    "capabilities": "capability",
+    "skill": "capability",
+    "skills": "capability",
+    "competency": "capability",
+    "competencies": "capability",
+    "high": "strong",
+    "highest": "strong",
+    "top": "strong",
+    "best": "strong",
+    "strengths": "strength",
+    "weakness": "weak",
+    "weaknesses": "weak",
+    "gaps": "gap",
+}
+
+
 def _tokenise(text: str) -> set[str]:
-    """Lower-case word tokens, filtering stop-words."""
-    _STOP = {
-        "the", "a", "an", "is", "in", "of", "to", "and", "or", "for",
-        "with", "on", "at", "by", "from", "that", "this", "it", "be",
-        "was", "are", "were", "has", "have", "had", "not", "but", "as",
-        "what", "how", "when", "which", "who", "did", "do", "does",
-        "can", "could", "will", "would", "should", "about", "tell", "me",
-        "any", "there", "their", "they", "them", "we", "us", "our",
-        "you", "your", "all", "also", "if",
-    }
-    tokens = set(re.findall(r"[a-z]+", text.lower()))
-    return tokens - _STOP
+    """Lower-case word tokens, filtering stop-words with synonym & typo normalization."""
+    raw_tokens = re.findall(r"[a-z]+", text.lower())
+    tokens: set[str] = set()
+    for tok in raw_tokens:
+        if tok in _STOP:
+            continue
+        mapped = _HIRING_SYNONYMS.get(tok)
+        if mapped:
+            tokens.add(mapped)
+        elif len(tok) > 4 and tok.endswith("ies"):
+            tokens.add(tok[:-3] + "y")
+        elif len(tok) > 3 and tok.endswith("s") and not tok.endswith("ss"):
+            tokens.add(tok[:-1])
+        else:
+            tokens.add(tok)
+    return tokens
 
 
 def _relevance(query_tokens: set[str], chunk_text: str) -> float:
@@ -702,6 +735,22 @@ async def retrieve_context_chunks(
         try:
             vector_res = await session.execute(vector_stmt)
             vector_rows = vector_res.all()
+            if not vector_rows:
+                from sqlalchemy import func
+                count_stmt = select(func.count(RagEmbedding.id)).where(RagEmbedding.organization_id == organization_id)
+                total_indexed = (await session.execute(count_stmt)).scalar() or 0
+                if total_indexed == 0:
+                    logger.info("RagEmbedding table is empty for organization %s. Auto-syncing tenant index...", organization_id)
+                    await sync_tenant_rag_index(
+                        session=session,
+                        organization_id=organization_id,
+                        provider=active_provider,
+                        allow_mock=is_mock_session,
+                        reconcile=False,
+                    )
+                    await session.flush()
+                    vector_res = await session.execute(vector_stmt)
+                    vector_rows = vector_res.all()
         except Exception as exc:
             logger.error("Vector search query failed in PostgreSQL: %s", exc)
             raise RagRetrievalError(f"Vector search query failed: {exc}") from exc
@@ -808,6 +857,15 @@ async def retrieve_context_chunks(
     # 6. Filter by min_relevance threshold
     # Irrelevant chunks and weak incidental matches are strictly excluded.
     relevant_chunks = [c for c in deduped_map.values() if c.relevance_score >= min_relevance]
+
+    # Scope-aware fallback: if candidate or job scope is explicitly specified and filtered list is empty,
+    # preserve candidate/job chunks so the LLM has context to answer direct questions
+    if not relevant_chunks and deduped_map and (application_id is not None or job_id is not None):
+        logger.info("Using scope-aware fallback chunks for application/job query")
+        fallback_chunks = list(deduped_map.values())
+        for fc in fallback_chunks:
+            fc.relevance_score = max(fc.relevance_score, min_relevance)
+        relevant_chunks = fallback_chunks
 
     # 7. Deterministic tie-breaking: primary = descending relevance_score, secondary = ascending chunk_id
     relevant_chunks.sort(key=lambda c: (-c.relevance_score, c.chunk_id))

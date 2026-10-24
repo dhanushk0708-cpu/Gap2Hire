@@ -17,11 +17,15 @@ async def create_email_connection(
     data: EmailConnectionCreate,
 ) -> EmailConnection:
     """Creates a new tenant-scoped email connection."""
+    conn_status = data.status
+    if data.provider.upper() == "GMAIL" and not data.auth_payload_encrypted:
+        conn_status = "PENDING"
+
     conn = EmailConnection(
         organization_id=organization_id,
         provider=data.provider.upper(),
         account_email=data.account_email.strip().lower(),
-        status=data.status,
+        status=conn_status,
         auth_payload_encrypted=data.auth_payload_encrypted,
     )
     session.add(conn)

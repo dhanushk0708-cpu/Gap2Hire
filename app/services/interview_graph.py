@@ -471,54 +471,100 @@ async def initialize_interview_state_from_db(
     capabilities = list((await session.scalars(caps_stmt)).all())
     caps_list = [{"id": str(c.id), "name": c.name, "importance": c.importance} for c in capabilities]
 
-    # 2. Load interview rounds and question templates
-    rounds_stmt = (
-        select(InterviewRound)
-        .where(InterviewRound.job_id == job_id, InterviewRound.status == "ACTIVE")
-        .options(selectinload(InterviewRound.question_templates))
-        .order_by(InterviewRound.sequence.asc())
+    # 2. Check if candidate application has an approved InterviewPlan
+    from app.models.interview_plan import InterviewPlan, InterviewPlanRound
+    plan_stmt = (
+        select(InterviewPlan)
+        .where(
+            InterviewPlan.application_id == app_id,
+            InterviewPlan.status == "APPROVED",
+        )
+        .options(
+            selectinload(InterviewPlan.rounds).selectinload(InterviewPlanRound.questions)
+        )
+        .order_by(InterviewPlan.version.desc())
     )
-    rounds_db = list((await session.scalars(rounds_stmt)).all())
+    approved_plan = await session.scalar(plan_stmt)
 
-    # Fallback if no rounds configured: generate default round & templates from capabilities
-    if not rounds_db:
-        default_templates = []
-        for i, cap in enumerate(capabilities, 1):
-            default_templates.append({
-                "id": f"default-t-{cap.id}",
-                "capability_id": str(cap.id),
-                "question_intent": "KNOWLEDGE",
-                "question_text": f"Can you explain your experience and depth with {cap.name}?",
-                "max_followups": 2,
-                "sequence": i,
-            })
-        rounds_list = [{
-            "id": "default-round-1",
-            "name": "Technical Assessment",
-            "round_type": "TECHNICAL",
-            "sequence": 1,
-            "templates": default_templates,
-        }]
-    else:
+    if approved_plan and approved_plan.rounds:
         rounds_list = []
-        for r in rounds_db:
+        for r in approved_plan.rounds:
             t_list = []
-            for t in sorted(r.question_templates, key=lambda x: x.sequence):
+            for q in sorted(r.questions, key=lambda x: x.sequence):
+                matched_cap = next(
+                    (c for c in capabilities if c.name.strip().lower() == q.concept.strip().lower()),
+                    None,
+                )
                 t_list.append({
-                    "id": str(t.id),
-                    "capability_id": str(t.capability_id) if t.capability_id else None,
-                    "question_intent": t.question_intent,
-                    "question_text": t.question_text,
-                    "max_followups": t.max_followups,
-                    "sequence": t.sequence,
+                    "id": str(q.id),
+                    "capability_id": str(matched_cap.id) if matched_cap else None,
+                    "question_intent": q.question_type or "KNOWLEDGE",
+                    "question_text": q.question_text,
+                    "max_followups": 2,
+                    "sequence": q.sequence,
+                    "is_hr_authored": q.is_hr_authored,
+                    "difficulty": q.difficulty,
                 })
             rounds_list.append({
                 "id": str(r.id),
-                "name": r.name,
-                "round_type": r.round_type,
+                "name": r.title,
+                "round_type": "TECHNICAL",
                 "sequence": r.sequence,
+                "objective": r.objective,
+                "difficulty": r.difficulty,
+                "evaluation_criteria": r.evaluation_criteria or [],
+                "expected_evidence": r.expected_evidence or [],
+                "question_generation_mode": r.question_generation_mode,
                 "templates": t_list,
             })
+    else:
+        # Load job interview rounds and question templates as fallback
+        rounds_stmt = (
+            select(InterviewRound)
+            .where(InterviewRound.job_id == job_id, InterviewRound.status == "ACTIVE")
+            .options(selectinload(InterviewRound.question_templates))
+            .order_by(InterviewRound.sequence.asc())
+        )
+        rounds_db = list((await session.scalars(rounds_stmt)).all())
+
+        if not rounds_db:
+            default_templates = []
+            for i, cap in enumerate(capabilities, 1):
+                default_templates.append({
+                    "id": f"default-t-{cap.id}",
+                    "capability_id": str(cap.id),
+                    "question_intent": "KNOWLEDGE",
+                    "question_text": f"Can you explain your experience and depth with {cap.name}?",
+                    "max_followups": 2,
+                    "sequence": i,
+                })
+            rounds_list = [{
+                "id": "default-round-1",
+                "name": "Technical Assessment",
+                "round_type": "TECHNICAL",
+                "sequence": 1,
+                "templates": default_templates,
+            }]
+        else:
+            rounds_list = []
+            for r in rounds_db:
+                t_list = []
+                for t in sorted(r.question_templates, key=lambda x: x.sequence):
+                    t_list.append({
+                        "id": str(t.id),
+                        "capability_id": str(t.capability_id) if t.capability_id else None,
+                        "question_intent": t.question_intent,
+                        "question_text": t.question_text,
+                        "max_followups": t.max_followups,
+                        "sequence": t.sequence,
+                    })
+                rounds_list.append({
+                    "id": str(r.id),
+                    "name": r.name,
+                    "round_type": r.round_type,
+                    "sequence": r.sequence,
+                    "templates": t_list,
+                })
 
     # 3. Pre-interview analysis
     pre_analysis = await build_pre_interview_analysis(

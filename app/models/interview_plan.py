@@ -40,6 +40,7 @@ class InterviewPlan(Base):
         nullable=True,
     )
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    lock_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="DRAFT", nullable=False, index=True)
     candidate_strengths_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     verification_targets_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -93,7 +94,16 @@ class InterviewPlanRound(Base):
     round_number: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     objective: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     concepts: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    evaluation_criteria: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    expected_evidence: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    question_generation_mode: Mapped[str] = mapped_column(
+        String(50),
+        default="AI_GENERATED",
+        nullable=False,
+    )
+    difficulty: Mapped[str] = mapped_column(String(50), default="MEDIUM", nullable=False)
     estimated_duration_minutes: Mapped[int] = mapped_column(Integer, default=30, nullable=False)
     required: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -131,6 +141,8 @@ class InterviewPlanQuestion(Base):
     question_type: Mapped[str] = mapped_column(String(50), default="CONCEPTUAL", nullable=False)
     purpose: Mapped[str | None] = mapped_column(Text, nullable=True)
     evidence_being_verified: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_hr_authored: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="APPROVED", nullable=False)
     sequence: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

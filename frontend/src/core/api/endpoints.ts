@@ -14,6 +14,8 @@ import type {
   CandidateInterviewPreAnalysis,
   InterviewPlan,
   InterviewPlanRound,
+  InterviewPlanQuestion,
+  RoundQuestionGeneratePreviewRequest,
   InterviewDatasetFile,
   InterviewScheduleResponse,
   InterviewReport,
@@ -34,6 +36,10 @@ import type {
   HiringChatRequest,
   HiringChatResponse,
   IndexSyncResponse,
+  InterviewerItem,
+  SimulatedNotificationItem,
+  BookingSlotItem,
+  CandidateBookingView,
 } from '../types';
 
 export const authApi = {
@@ -348,12 +354,24 @@ export const interviewPlansApi = {
 
   update: (
     planId: string,
-    data: { rounds: InterviewPlanRound[]; hr_feedback?: string }
+    data: { rounds: InterviewPlanRound[]; hr_feedback?: string; lock_version?: number }
   ) =>
     apiClient<InterviewPlan>(`/api/v1/interview-plans/${planId}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
+
+  previewQuestions: (
+    applicationId: string,
+    data: RoundQuestionGeneratePreviewRequest
+  ) =>
+    apiClient<InterviewPlanQuestion[]>(
+      `/api/v1/applications/${applicationId}/interview/plans/preview-questions`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    ),
 
   approve: (planId: string, notes?: string) =>
     apiClient<InterviewPlan>(`/api/v1/interview-plans/${planId}/approve`, {
@@ -441,6 +459,39 @@ export const interviewSessionsApi = {
       method: 'POST',
     }),
 
+  retryReport: (sessionId: string) =>
+    apiClient<InterviewReport>(`/api/v1/interviews/${sessionId}/report/retry`, {
+      method: 'POST',
+    }),
+
+  start: (
+    sessionId: string,
+    data?: { duration_minutes?: number; media_verified?: boolean }
+  ) =>
+    apiClient<any>(`/api/v1/interviews/${sessionId}/start`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+
+  complete: (sessionId: string, data?: { reason?: string }) =>
+    apiClient<any>(`/api/v1/interviews/${sessionId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
+    }),
+
+  getExecutionState: (sessionId: string) =>
+    apiClient<{
+      session_id: string;
+      interview_status: string;
+      current_question_index: number;
+      total_questions: number;
+      duration_minutes?: number | null;
+      deadline_at?: string | null;
+      remaining_seconds?: number | null;
+      completion_reason?: string | null;
+      report_status?: string | null;
+    }>(`/api/v1/interviews/${sessionId}/state`),
+
   getIntegrityEvents: (sessionId: string) =>
     apiClient<{
       session_id: string;
@@ -487,6 +538,11 @@ export const emailApi = {
       method: 'DELETE',
     }),
 
+  getGoogleAuthUrl: (state?: string) =>
+    apiClient<{ authorization_url: string }>('/api/v1/email-connections/oauth/google/url', {
+      params: state ? { state } : undefined,
+    }),
+
   sync: (limit = 10, targetJobId?: string) =>
     apiClient<BatchEmailSyncResponse>('/api/v1/email/sync', {
       method: 'POST',
@@ -508,3 +564,121 @@ export const hiringChatApi = {
     }),
 };
 
+export const interviewSchedulerApi = {
+  list: (params?: {
+    status?: string;
+    candidate?: string;
+    interviewer_id?: string;
+    application_id?: string;
+    date?: string;
+  }) =>
+    apiClient<InterviewScheduleResponse[]>('/api/v1/interviews/schedules', {
+      params,
+    }),
+
+  get: (scheduleId: string) =>
+    apiClient<InterviewScheduleResponse>(`/api/v1/interviews/schedules/${scheduleId}`),
+
+  schedule: (data: {
+    application_id: string;
+    interviewer_id?: string;
+    scheduled_start: string;
+    timezone?: string;
+    duration_minutes?: number;
+    interview_type?: string;
+    location?: string;
+    invitation_notes?: string;
+  }) =>
+    apiClient<InterviewScheduleResponse>('/api/v1/interviews/schedules', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  reschedule: (
+    scheduleId: string,
+    data: {
+      scheduled_start?: string;
+      duration_minutes?: number;
+      timezone?: string;
+      interviewer_id?: string;
+      interview_type?: string;
+      location?: string;
+      invitation_notes?: string;
+      reschedule_reason?: string;
+    }
+  ) =>
+    apiClient<InterviewScheduleResponse>(
+      `/api/v1/interviews/schedules/${scheduleId}/reschedule`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    ),
+
+  cancel: (scheduleId: string, reason: string) =>
+    apiClient<InterviewScheduleResponse>(
+      `/api/v1/interviews/schedules/${scheduleId}/cancel`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ reason }),
+      }
+    ),
+
+  complete: (scheduleId: string) =>
+    apiClient<InterviewScheduleResponse>(
+      `/api/v1/interviews/schedules/${scheduleId}/complete`,
+      {
+        method: 'POST',
+      }
+    ),
+
+  getNotifications: (params?: { schedule_id?: string; interview_reference?: string }) =>
+    apiClient<SimulatedNotificationItem[]>('/api/v1/interviews/notifications', {
+      params,
+    }),
+
+  getInterviewers: () =>
+    apiClient<InterviewerItem[]>('/api/v1/interviews/interviewers'),
+
+  publishSlots: (
+    applicationId: string,
+    data: {
+      interviewer_id: string;
+      slots: Array<{ start_time: string; duration_minutes?: number }>;
+      interview_type?: string;
+      location?: string;
+    }
+  ) =>
+    apiClient<{
+      booking_token: string;
+      booking_url: string;
+      total_slots: number;
+      slots: BookingSlotItem[];
+    }>(`/api/v1/applications/${applicationId}/booking-slots`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+};
+
+export const candidateBookingApi = {
+  getView: (token: string) =>
+    apiClient<CandidateBookingView>(`/api/v1/booking/${token}/slots`),
+
+  book: (token: string, slotId: string) =>
+    apiClient<InterviewScheduleResponse>(`/api/v1/booking/${token}/book`, {
+      method: 'POST',
+      body: JSON.stringify({ slot_id: slotId }),
+    }),
+
+  reschedule: (token: string, slotId: string, reason?: string) =>
+    apiClient<InterviewScheduleResponse>(`/api/v1/booking/${token}/reschedule`, {
+      method: 'POST',
+      body: JSON.stringify({ slot_id: slotId, reason }),
+    }),
+
+  cancel: (token: string, reason?: string) =>
+    apiClient<InterviewScheduleResponse>(`/api/v1/booking/${token}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+};

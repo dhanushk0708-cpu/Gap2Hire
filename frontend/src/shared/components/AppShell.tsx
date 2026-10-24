@@ -15,6 +15,7 @@ import {
   Building,
   Sparkles,
   MessageSquare,
+  Calendar,
 } from 'lucide-react';
 import { useAuth } from '../../core/auth/AuthContext';
 
@@ -66,6 +67,12 @@ export const AppShell: React.FC = () => {
     {
       label: 'Interviews & Intelligence',
       items: [
+        {
+          to: '/interviews',
+          label: 'Interview Scheduler',
+          icon: Calendar,
+          visible: isRecruiterOrAdmin,
+        },
         {
           to: '/interview-datasets',
           label: 'Question Datasets',

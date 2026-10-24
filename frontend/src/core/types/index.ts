@@ -269,6 +269,8 @@ export interface InterviewPlanQuestion {
   question_type: string;
   purpose?: string | null;
   evidence_being_verified?: string | null;
+  is_hr_authored?: boolean;
+  status?: string;
   sequence: number;
 }
 
@@ -277,7 +279,12 @@ export interface InterviewPlanRound {
   round_number: number;
   title: string;
   objective: string;
+  description?: string | null;
   concepts: string[];
+  evaluation_criteria?: string[];
+  expected_evidence?: string[];
+  question_generation_mode?: 'AI_GENERATED' | 'HR_DEFINED' | 'HYBRID';
+  difficulty?: string;
   estimated_duration_minutes: number;
   required: boolean;
   reasoning?: string | null;
@@ -291,6 +298,7 @@ export interface InterviewPlan {
   job_id: string;
   dataset_file_id: string | null;
   version: number;
+  lock_version?: number;
   status: 'DRAFT' | 'APPROVED' | 'SUPERSEDED' | 'REJECTED';
   candidate_strengths_summary: string | null;
   verification_targets_summary: string | null;
@@ -301,6 +309,20 @@ export interface InterviewPlan {
   created_at: string;
   updated_at: string;
   rounds: InterviewPlanRound[];
+}
+
+export interface RoundQuestionGeneratePreviewRequest {
+  round_title: string;
+  objective: string;
+  description?: string | null;
+  concepts: string[];
+  evaluation_criteria?: string[];
+  expected_evidence?: string[];
+  difficulty?: string;
+  duration_minutes?: number;
+  question_generation_mode?: 'AI_GENERATED' | 'HR_DEFINED' | 'HYBRID';
+  hr_questions?: InterviewPlanQuestion[];
+  target_count?: number;
 }
 
 export interface DatasetQuestionItem {
@@ -338,20 +360,77 @@ export interface InterviewScheduleResponse {
   session_id: string;
   organization_id: string;
   application_id: string;
+  interviewer_id?: string | null;
+  interviewer_name?: string | null;
   scheduled_start: string;
   scheduled_end: string;
   timezone: string;
   duration_minutes: number;
   calendar_event_id: string | null;
-  meeting_url: string;
+  meeting_url: string | null;
   status: string;
+  interview_type: string;
+  interview_reference?: string | null;
+  location?: string | null;
+  cancellation_reason?: string | null;
+  booking_token?: string | null;
   candidate_email_sent: boolean;
+  candidate_email_id?: string | null;
   invitation_notes: string | null;
+  candidate_id?: string | null;
   candidate_name: string | null;
   candidate_email: string | null;
+  job_id?: string | null;
   job_title: string | null;
   created_at: string;
+  updated_at?: string;
 }
+
+export interface InterviewerItem {
+  id: string;
+  full_name: string;
+  email: string;
+  role: string;
+}
+
+export interface SimulatedNotificationItem {
+  id: string;
+  organization_id: string;
+  interview_schedule_id?: string | null;
+  recipient: string;
+  recipient_name?: string | null;
+  subject: string;
+  body: string;
+  interview_reference: string;
+  notification_type: string;
+  delivery_mode: string;
+  delivery_status: string;
+  demo_banner: string;
+  created_at: string;
+}
+
+export interface BookingSlotItem {
+  id: string;
+  start_time: string;
+  end_time: string;
+  duration_minutes: number;
+  interview_type: string;
+  location?: string | null;
+  is_booked: boolean;
+  interviewer_name?: string | null;
+}
+
+export interface CandidateBookingView {
+  booking_token: string;
+  job_title: string;
+  organization_name: string;
+  candidate_name: string;
+  interview_type: string;
+  duration_minutes: number;
+  slots: BookingSlotItem[];
+  current_booking?: InterviewScheduleResponse | null;
+}
+
 
 export type AvatarState = 'IDLE' | 'LISTENING' | 'THINKING' | 'SPEAKING' | 'ERROR';
 
@@ -378,6 +457,7 @@ export interface InterviewReport {
   job_id?: string | null;
   job_title?: string | null;
   status: string;
+  report_status?: string | null;
   generated_at?: string | null;
   generation_source: string;
   summary?: string | null;
@@ -403,6 +483,35 @@ export interface InterviewReport {
   total_messages: number;
   completed_at?: string | null;
   created_at?: string | null;
+  completion_reason?: string | null;
+  configured_duration_minutes?: number | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  plan_version?: number | null;
+  transcript?: Array<{
+    id?: string;
+    role: string;
+    content: string;
+    sequence_number?: number;
+    created_at?: string | null;
+    latency_ms?: number | null;
+  }>;
+  unanswered_questions?: Array<{
+    id?: string;
+    round_number?: number;
+    sequence?: number;
+    question_text: string;
+    category?: string;
+    target_competency?: string;
+    reason?: string;
+  }>;
+  media_events?: Array<{
+    event_type: string;
+    timestamp: string;
+    details?: any;
+  }>;
+  scorecard_data?: Record<string, any> | null;
+  failure_reason?: string | null;
 }
 
 export type HiringDecisionType = 'SELECTED' | 'REJECTED' | 'ON_HOLD';
@@ -623,8 +732,13 @@ export type IntegrityEventType =
   | 'FULLSCREEN_EXIT'
   | 'CAMERA_CONNECTED'
   | 'CAMERA_DISCONNECTED'
+  | 'CAMERA_MUTED'
   | 'MICROPHONE_CONNECTED'
   | 'MICROPHONE_DISCONNECTED'
+  | 'MICROPHONE_MUTED'
+  | 'MEDIA_RECOVERY_STARTED'
+  | 'MEDIA_RECOVERY_FAILED'
+  | 'DETECTOR_UNAVAILABLE'
   | 'CONNECTION_INTERRUPTED'
   | 'CONNECTION_RESTORED'
   | 'PHONE_DETECTED'

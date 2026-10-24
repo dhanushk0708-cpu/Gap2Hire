@@ -20,6 +20,7 @@ dependencies = [
 "langgraph",
 "langgraph-checkpoint-postgres",
 "openpyxl",
+"cryptography",
 ]
 
 [project.optional-dependencies]

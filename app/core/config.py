@@ -7,6 +7,9 @@ class Settings(BaseSettings):
     environment: str = "development"
     database_url: str
     jwt_secret_key: str
+    token_encryption_key: str = ""
+    frontend_url: str = "http://localhost:5173"
+    google_redirect_uri: str = ""
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
     storage_dir: str = "uploads"

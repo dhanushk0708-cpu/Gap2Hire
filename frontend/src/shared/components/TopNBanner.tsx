@@ -6,6 +6,8 @@ interface TopNBannerProps {
   evaluatedCount: number;
   shortlistedCount: number;
   onAdjustSize?: () => void;
+  onSelectSize?: (newSize: number) => void;
+  isUpdatingSize?: boolean;
 }
 
 export const TopNBanner: React.FC<TopNBannerProps> = ({
@@ -13,6 +15,8 @@ export const TopNBanner: React.FC<TopNBannerProps> = ({
   evaluatedCount,
   shortlistedCount,
   onAdjustSize,
+  onSelectSize,
+  isUpdatingSize,
 }) => {
   return (
     <div
@@ -50,9 +54,42 @@ export const TopNBanner: React.FC<TopNBannerProps> = ({
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', fontWeight: 500 }}>
               Target Shortlist
             </div>
-            <div style={{ fontSize: '1.125rem', fontWeight: 700, color: 'var(--text-main)' }}>
-              Top-{shortlistSize}
-            </div>
+            {onSelectSize ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', marginTop: '0.15rem' }}>
+                <select
+                  value={[3, 5, 10, 15, 20].includes(shortlistSize) ? shortlistSize : 'custom'}
+                  onChange={(e) => {
+                    if (e.target.value === 'custom') {
+                      onAdjustSize?.();
+                    } else {
+                      onSelectSize(Number(e.target.value));
+                    }
+                  }}
+                  disabled={isUpdatingSize}
+                  style={{
+                    fontWeight: 700,
+                    fontSize: '1rem',
+                    padding: '0.15rem 0.5rem',
+                    borderRadius: 'var(--radius-sm)',
+                    border: '1px solid var(--border-base)',
+                    backgroundColor: '#F8FAFC',
+                    color: 'var(--text-main)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  <option value={3}>Top-3</option>
+                  <option value={5}>Top-5</option>
+                  <option value={10}>Top-10</option>
+                  <option value={15}>Top-15</option>
+                  <option value={20}>Top-20</option>
+                  <option value="custom">{[3, 5, 10, 15, 20].includes(shortlistSize) ? 'Custom...' : `Custom (Top-${shortlistSize})`}</option>
+                </select>
+              </div>
+            ) : (
+              <div style={{ fontSize: '1.125rem', fontWeight: 700, color: 'var(--text-main)' }}>
+                Top-{shortlistSize}
+              </div>
+            )}
           </div>
         </div>
 

@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 from uuid import UUID, uuid4
@@ -16,17 +16,23 @@ from app.db.session import async_session_factory
 from app.models.interview import InterviewMessage, InterviewQuestion, InterviewSession
 from app.models.user import User
 from app.schemas.interview_avatar import AvatarState
-from app.schemas.interview_integrity import WSIntegrityEvent, WSIntegrityEventAck
+from app.schemas.interview_integrity import IntegrityEventType, WSIntegrityEvent, WSIntegrityEventAck
 from app.schemas.interview_voice import (
     WSCandidateAudioEvent,
 )
 from app.schemas.interview_ws import WSCandidateMessageEvent
 from app.services.interview import (
+    InterviewExpiredError,
     InvalidSessionStateError,
     InterviewSessionNotFoundError,
+    MediaReadinessRequiredError,
+    _get_remaining_seconds,
+    _is_expired,
+    complete_interview_session_atomic,
     generate_next_question_for_session,
     get_tenant_interview_session,
     process_live_candidate_message,
+    start_interview_session,
 )
 from app.services.interview_integrity import (
     IntegritySessionAccessDeniedError,
@@ -150,31 +156,37 @@ async def interview_websocket_endpoint(
                 )
                 return
 
-        # Auto-start session if in CREATED or SCHEDULED state
-        if interview_session.status in ("CREATED", "SCHEDULED"):
-            interview_session.status = "IN_PROGRESS"
-            interview_session.started_at = datetime.utcnow()
-            interview_session.updated_at = datetime.utcnow()
-            msg_count_stmt = select(func.count(InterviewMessage.id)).where(InterviewMessage.session_id == session_id)
-            has_msgs = ((await db_session.scalar(msg_count_stmt)) or 0) > 0
-            if not has_msgs:
-                sys_msg = InterviewMessage(
-                    session_id=interview_session.id,
-                    role="SYSTEM",
-                    content="Interview session started.",
-                    sequence_number=1,
-                )
-                db_session.add(sys_msg)
-            await db_session.commit()
-            logger.info(f"[WS AUTO-START] Transitioned session {session_id} from {interview_session.status} to IN_PROGRESS")
-
-        elif interview_session.status != "IN_PROGRESS":
-            logger.warning(f"[WS STATUS REJECT] Session {session_id} in status '{interview_session.status}'")
-            await websocket.close(
-                code=status.WS_1008_POLICY_VIOLATION,
-                reason=f"Interview session is in '{interview_session.status}' status",
-            )
+        # Check completed status
+        if interview_session.status == "COMPLETED":
+            await websocket.accept()
+            await websocket.send_json({
+                "type": "interview_completed",
+                "reason": interview_session.completion_reason or "COMPLETED",
+                "message": "Interview session is completed.",
+                "report_url": f"/interviews/{session_id}/report",
+            })
+            await websocket.close(code=status.WS_1000_NORMAL_CLOSURE, reason="Interview completed")
             return
+
+        # Check deadline if already in progress
+        if interview_session.status == "IN_PROGRESS" and _is_expired(interview_session.deadline_at):
+            await complete_interview_session_atomic(
+                session=db_session,
+                session_id=session_id,
+                organization_id=user.organization_id,
+                reason="TIME_EXPIRED",
+            )
+            await websocket.accept()
+            await websocket.send_json({
+                "type": "interview_completed",
+                "reason": "TIME_EXPIRED",
+                "message": "Interview time is over.",
+                "report_url": f"/interviews/{session_id}/report",
+            })
+            await websocket.close(code=status.WS_1000_NORMAL_CLOSURE, reason="Interview time is over")
+            return
+
+        is_waiting_for_readiness = interview_session.status in ("CREATED", "SCHEDULED")
 
     # 4. Connection Manager (supports multiple / reconnecting sockets)
     is_candidate = (user.role == UserRole.CANDIDATE.value)
@@ -195,63 +207,75 @@ async def interview_websocket_endpoint(
             "type": "system",
             "event": "connected",
             "content": "Connected to real-time live interview session.",
+            "is_waiting_for_readiness": is_waiting_for_readiness,
         },
     )
 
-    # 6. Immediately verify or generate the active interview question
-    async with async_session_factory() as db_session:
-        q_stmt = (
-            select(InterviewQuestion)
-            .where(InterviewQuestion.session_id == session_id)
-            .order_by(InterviewQuestion.sequence_number.desc())
+    # If already IN_PROGRESS, broadcast authoritative deadline
+    if not is_waiting_for_readiness and interview_session.deadline_at:
+        rem_secs = _get_remaining_seconds(interview_session.deadline_at)
+        await connection_manager.send_json(
+            session_id,
+            {
+                "type": "duration_deadline",
+                "remaining_seconds": rem_secs,
+                "deadline_at": (interview_session.deadline_at if interview_session.deadline_at.tzinfo else interview_session.deadline_at.replace(tzinfo=timezone.utc)).isoformat(),
+                "duration_minutes": interview_session.duration_minutes,
+            },
         )
-        existing_q = await db_session.scalar(q_stmt)
 
-        current_question_text = None
-        target_cap_name = "General"
+    # 6. Immediately verify or generate the active interview question (only if session active)
+    if not is_waiting_for_readiness:
+        async with async_session_factory() as db_session:
+            q_stmt = (
+                select(InterviewQuestion)
+                .where(InterviewQuestion.session_id == session_id)
+                .order_by(InterviewQuestion.sequence_number.desc())
+            )
+            existing_q = await db_session.scalar(q_stmt)
 
-        if isinstance(existing_q, InterviewQuestion):
-            current_question_text = existing_q.question
-            target_cap_name = existing_q.concept or "General"
-            logger.info(f"[WS QUESTION RESUMED] session_id={session_id}, seq={existing_q.sequence_number}")
-        else:
-            try:
-                new_q = await generate_next_question_for_session(
-                    session=db_session,
-                    session_id=session_id,
-                    organization_id=user.organization_id,
+            current_question_text = None
+            target_cap_name = "General"
+
+            if isinstance(existing_q, InterviewQuestion):
+                current_question_text = existing_q.question
+                target_cap_name = existing_q.concept or "General"
+                logger.info(f"[WS QUESTION RESUMED] session_id={session_id}, seq={existing_q.sequence_number}")
+            else:
+                try:
+                    new_q = await generate_next_question_for_session(
+                        session=db_session,
+                        session_id=session_id,
+                        organization_id=user.organization_id,
+                    )
+                    current_question_text = new_q.question
+                    target_cap_name = new_q.concept or "General"
+                    logger.info(f"[WS QUESTION GENERATED] session_id={session_id}, seq={new_q.sequence_number}")
+                except Exception as q_err:
+                    logger.error(f"[WS QUESTION ERROR] Could not generate initial question: {q_err}", exc_info=True)
+
+            if current_question_text:
+                await connection_manager.send_json(
+                    session_id,
+                    build_avatar_state_event(AvatarState.SPEAKING),
                 )
-                current_question_text = new_q.question
-                target_cap_name = new_q.concept or "General"
-                logger.info(f"[WS QUESTION GENERATED] session_id={session_id}, seq={new_q.sequence_number}")
-            except Exception as q_err:
-                logger.error(f"[WS QUESTION ERROR] Could not generate initial question: {q_err}", exc_info=True)
-
-        if current_question_text:
-            # Avatar transitions to SPEAKING state
-            await connection_manager.send_json(
-                session_id,
-                build_avatar_state_event(AvatarState.SPEAKING),
-            )
-            # Send AI question message
-            await connection_manager.send_json(
-                session_id,
-                {
-                    "type": "ai_message",
-                    "content": current_question_text,
-                    "target_capability": target_cap_name,
-                },
-            )
-            # Avatar transitions to LISTENING state so candidate can answer
-            await connection_manager.send_json(
-                session_id,
-                build_avatar_state_event(AvatarState.LISTENING),
-            )
-        else:
-            await connection_manager.send_json(
-                session_id,
-                build_avatar_state_event(AvatarState.IDLE),
-            )
+                await connection_manager.send_json(
+                    session_id,
+                    {
+                        "type": "ai_message",
+                        "content": current_question_text,
+                        "target_capability": target_cap_name,
+                    },
+                )
+                await connection_manager.send_json(
+                    session_id,
+                    build_avatar_state_event(AvatarState.LISTENING),
+                )
+            else:
+                await connection_manager.send_json(
+                    session_id,
+                    build_avatar_state_event(AvatarState.IDLE),
+                )
 
     # 7. Message Loop
     try:
@@ -285,6 +309,99 @@ async def interview_websocket_endpoint(
                 continue
 
             event_type = data.get("type")
+
+            # -------------------------------------------------------------
+            # S. Explicit Start Interview event from Pre-Interview AV Gate
+            # -------------------------------------------------------------
+            if event_type == "start_interview":
+                duration = data.get("duration_minutes") or 30
+                media_verified = data.get("media_verified", True)
+                try:
+                    async with async_session_factory() as db_session:
+                        started_sess = await start_interview_session(
+                            session=db_session,
+                            session_id=session_id,
+                            organization_id=user.organization_id,
+                            duration_minutes=duration,
+                            media_verified=media_verified,
+                        )
+                        rem_secs = _get_remaining_seconds(started_sess.deadline_at)
+
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "duration_deadline",
+                            "remaining_seconds": rem_secs,
+                            "deadline_at": (started_sess.deadline_at if started_sess.deadline_at.tzinfo else started_sess.deadline_at.replace(tzinfo=timezone.utc)).isoformat() if started_sess.deadline_at else None,
+                            "duration_minutes": started_sess.duration_minutes,
+                        },
+                    )
+
+                    # Trigger initial question
+                    async with async_session_factory() as db_session:
+                        q_stmt = (
+                            select(InterviewQuestion)
+                            .where(InterviewQuestion.session_id == session_id)
+                            .order_by(InterviewQuestion.sequence_number.desc())
+                        )
+                        existing_q = await db_session.scalar(q_stmt)
+                        if not existing_q:
+                            existing_q = await generate_next_question_for_session(
+                                session=db_session,
+                                session_id=session_id,
+                                organization_id=user.organization_id,
+                            )
+                        if existing_q:
+                            await connection_manager.send_json(
+                                session_id,
+                                build_avatar_state_event(AvatarState.SPEAKING),
+                            )
+                            await connection_manager.send_json(
+                                session_id,
+                                {
+                                    "type": "ai_message",
+                                    "content": existing_q.question,
+                                    "target_capability": existing_q.concept or "General",
+                                },
+                            )
+                            await connection_manager.send_json(
+                                session_id,
+                                build_avatar_state_event(AvatarState.LISTENING),
+                            )
+                except Exception as start_err:
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "system",
+                            "event": "error",
+                            "content": f"Could not start interview session: {start_err}",
+                        },
+                    )
+                continue
+
+            # -------------------------------------------------------------
+            # Deadline Guard: Check if interview time is expired
+            # -------------------------------------------------------------
+            async with async_session_factory() as db_session:
+                curr_sess = await db_session.scalar(select(InterviewSession).where(InterviewSession.id == session_id))
+                if curr_sess and (curr_sess.status == "COMPLETED" or _is_expired(curr_sess.deadline_at)):
+                    if curr_sess.status != "COMPLETED":
+                        await complete_interview_session_atomic(
+                            session=db_session,
+                            session_id=session_id,
+                            organization_id=user.organization_id,
+                            reason="TIME_EXPIRED",
+                        )
+                    await connection_manager.send_json(
+                        session_id,
+                        {
+                            "type": "interview_completed",
+                            "reason": "TIME_EXPIRED",
+                            "message": "Interview time is over.",
+                            "report_url": f"/interviews/{session_id}/report",
+                        },
+                    )
+                    continue
 
             # -------------------------------------------------------------
             # A. Text Mode: Candidate Message
@@ -648,6 +765,48 @@ async def interview_websocket_endpoint(
                         ack_event.model_dump(),
                     )
 
+                    # Mid-interview Media loss warning & recovery (Requirement 4)
+                    if integrity_event_payload.event_type.value in (
+                        "CAMERA_DISCONNECTED",
+                        "CAMERA_MUTED",
+                        "MICROPHONE_DISCONNECTED",
+                        "MICROPHONE_MUTED",
+                    ):
+                        await connection_manager.send_json(
+                            session_id,
+                            {
+                                "type": "media_warning",
+                                "event": "media_lost",
+                                "warning": "Camera or microphone lost. Please restore within 30 seconds to resume.",
+                                "recovery_timeout_seconds": 30,
+                            },
+                        )
+                    elif integrity_event_payload.event_type.value in ("CAMERA_CONNECTED", "MICROPHONE_CONNECTED"):
+                        await connection_manager.send_json(
+                            session_id,
+                            {
+                                "type": "media_restored",
+                                "message": "Camera and microphone restored. Resuming interview.",
+                            },
+                        )
+                    elif integrity_event_payload.event_type.value in ("MEDIA_RECOVERY_FAILED", "INTERRUPTED_MEDIA_FAILURE"):
+                        async with async_session_factory() as db_session:
+                            await complete_interview_session_atomic(
+                                session=db_session,
+                                session_id=session_id,
+                                organization_id=user.organization_id,
+                                reason="INTERRUPTED_MEDIA_FAILURE",
+                            )
+                        await connection_manager.send_json(
+                            session_id,
+                            {
+                                "type": "interview_completed",
+                                "reason": "INTERRUPTED_MEDIA_FAILURE",
+                                "message": "Interview terminated due to unrecovered camera/microphone loss.",
+                                "report_url": f"/interviews/{session_id}/report",
+                            },
+                        )
+
                     # If vision detection observation, broadcast red alert to candidate & HR observers
                     if integrity_event_payload.event_type.value in ("PHONE_DETECTED", "MULTIPLE_PERSONS_DETECTED"):
                         alert_msg = (
@@ -696,20 +855,35 @@ async def interview_websocket_endpoint(
             # D. Client Sampled Camera Frame for Vision Monitoring
             # -------------------------------------------------------------
             elif event_type == "vision_frame":
-                image_b64 = data.get("image")
-                if image_b64:
-                    if "," in image_b64:
-                        image_b64 = image_b64.split(",", 1)[1]
-                    try:
-                        raw_bytes = base64.b64decode(image_b64)
-                        from app.services.vision_service import vision_service
-                        await vision_service.process_sampled_frame(
-                            session_id=session_id,
-                            image_bytes=raw_bytes,
-                            user=user,
-                        )
-                    except Exception as frame_err:
-                        logger.debug(f"[WS VISION FRAME ERROR] session {session_id}: {frame_err}")
+                from app.services.vision_service import vision_service
+                if not vision_service.is_available:
+                    if not getattr(websocket, "_detector_unavailable_logged", False):
+                        setattr(websocket, "_detector_unavailable_logged", True)
+                        try:
+                            async with async_session_factory() as db_session:
+                                await record_integrity_event(
+                                    session=db_session,
+                                    session_id=session_id,
+                                    event_type=IntegrityEventType.DETECTOR_UNAVAILABLE,
+                                    user=user,
+                                    metadata={"limitation": "Vision detector unavailable or disabled; behavioral telemetry restricted to browser events."},
+                                )
+                        except Exception as det_err:
+                            logger.debug(f"Could not record detector unavailable event: {det_err}")
+                else:
+                    image_b64 = data.get("image")
+                    if image_b64:
+                        if "," in image_b64:
+                            image_b64 = image_b64.split(",", 1)[1]
+                        try:
+                            raw_bytes = base64.b64decode(image_b64)
+                            await vision_service.process_sampled_frame(
+                                session_id=session_id,
+                                image_bytes=raw_bytes,
+                                user=user,
+                            )
+                        except Exception as frame_err:
+                            logger.debug(f"[WS VISION FRAME ERROR] session {session_id}: {frame_err}")
 
             # -------------------------------------------------------------
             # D. Unsupported Event Type

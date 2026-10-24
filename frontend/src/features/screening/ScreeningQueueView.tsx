@@ -29,6 +29,7 @@ export const ScreeningQueueView: React.FC = () => {
 
   const [isAdjustShortlistOpen, setIsAdjustShortlistOpen] = useState(false);
   const [newShortlistSize, setNewShortlistSize] = useState(5);
+  const [isUpdatingShortlistSize, setIsUpdatingShortlistSize] = useState(false);
   const [isDemoModalOpen, setIsDemoModalOpen] = useState(false);
   const [demoFile, setDemoFile] = useState<File | null>(null);
   const [demoLoading, setDemoLoading] = useState(false);
@@ -97,6 +98,19 @@ export const ScreeningQueueView: React.FC = () => {
       await Promise.all([refetchCurrentJob(), refetchTopN(), refetchCandidates()]);
     } catch (err: any) {
       alert(err.message || 'Failed to update shortlist capacity');
+    }
+  };
+
+  const handleQuickChangeShortlistSize = async (newSize: number) => {
+    if (!activeJobId || newSize === currentJob?.shortlist_size) return;
+    setIsUpdatingShortlistSize(true);
+    try {
+      await jobsApi.updateShortlistSize(activeJobId, newSize);
+      await Promise.all([refetchCurrentJob(), refetchTopN(), refetchCandidates()]);
+    } catch (err: any) {
+      alert(err.message || 'Failed to update shortlist target');
+    } finally {
+      setIsUpdatingShortlistSize(false);
     }
   };
 
@@ -209,6 +223,7 @@ export const ScreeningQueueView: React.FC = () => {
           gap: '1rem',
           marginBottom: '1.25rem',
           padding: '0.875rem 1.25rem',
+          flexWrap: 'wrap',
         }}
       >
         <span style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main)', whiteSpace: 'nowrap' }}>
@@ -240,6 +255,45 @@ export const ScreeningQueueView: React.FC = () => {
             Position Blueprint <ExternalLink size={13} />
           </Link>
         )}
+
+        {/* Shortlist Target Quick Selector */}
+        {activeJobId && currentJob && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginLeft: 'auto' }}>
+            <span style={{ fontSize: '0.8125rem', fontWeight: 600, color: 'var(--text-main)', whiteSpace: 'nowrap' }}>
+              Shortlist Target:
+            </span>
+            <select
+              id="header-shortlist-target-select"
+              value={[3, 5, 10, 15, 20].includes(currentJob.shortlist_size) ? currentJob.shortlist_size : 'custom'}
+              onChange={(e) => {
+                if (e.target.value === 'custom') {
+                  setNewShortlistSize(currentJob.shortlist_size);
+                  setIsAdjustShortlistOpen(true);
+                } else {
+                  handleQuickChangeShortlistSize(Number(e.target.value));
+                }
+              }}
+              disabled={isUpdatingShortlistSize}
+              style={{
+                fontSize: '0.8125rem',
+                fontWeight: 600,
+                padding: '0.35rem 0.65rem',
+                borderRadius: 'var(--radius-sm)',
+                minWidth: '95px',
+                cursor: 'pointer',
+              }}
+            >
+              <option value={3}>Top-3</option>
+              <option value={5}>Top-5</option>
+              <option value={10}>Top-10</option>
+              <option value={15}>Top-15</option>
+              <option value={20}>Top-20</option>
+              <option value="custom">
+                {[3, 5, 10, 15, 20].includes(currentJob.shortlist_size) ? 'Custom...' : `Custom (Top-${currentJob.shortlist_size})`}
+              </option>
+            </select>
+          </div>
+        )}
       </div>
 
       {syncResult && (
@@ -264,6 +318,8 @@ export const ScreeningQueueView: React.FC = () => {
           shortlistSize={currentJob.shortlist_size}
           evaluatedCount={totalEvaluated}
           shortlistedCount={shortlistedCount}
+          onSelectSize={handleQuickChangeShortlistSize}
+          isUpdatingSize={isUpdatingShortlistSize}
           onAdjustSize={() => {
             setNewShortlistSize(currentJob.shortlist_size);
             setIsAdjustShortlistOpen(true);

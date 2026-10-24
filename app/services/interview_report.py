@@ -9,11 +9,13 @@ from sqlalchemy.orm import selectinload
 
 from app.models.application import Application
 from app.models.candidate import Candidate
+from app.models.candidate_scorecard import CandidateScorecard
 from app.models.capability import Capability
 from app.models.evidence import Evidence
 from app.models.interview import InterviewMessage, InterviewQuestion, InterviewSession
 from app.models.interview_answer_analysis import InterviewAnswerAnalysis
 from app.models.interview_integrity import InterviewIntegrityEvent
+from app.models.interview_plan import InterviewPlan, InterviewPlanQuestion, InterviewPlanRound
 from app.models.interview_report import InterviewReportModel
 from app.models.interview_round import InterviewRound
 from app.models.job import Job
@@ -92,353 +94,461 @@ async def generate_and_persist_interview_report(
     candidate = application.candidate
     job = application.job
 
-    # 3. Load job capabilities
+    # 3. Load job capabilities and approved plan
     caps_stmt = select(Capability).where(Capability.job_id == job.id)
     job_capabilities = (await session.scalars(caps_stmt)).all()
 
-    # 4. Load pre-interview analysis for grounded baseline
-    pre_analysis = await build_candidate_interview_pre_analysis(
-        session=session,
-        application_id=application.id,
-        organization_id=organization_id,
+    plan_stmt = (
+        select(InterviewPlan)
+        .where(
+            InterviewPlan.application_id == application.id,
+            InterviewPlan.organization_id == organization_id,
+            InterviewPlan.status == "APPROVED",
+        )
+        .options(
+            selectinload(InterviewPlan.rounds)
+            .selectinload(InterviewPlanRound.questions),
+        )
+        .order_by(InterviewPlan.version.desc())
     )
-
-    # 5. Extract answers and analyses indexed by question_id
-    analyses_by_qid: dict[UUID, InterviewAnswerAnalysis] = {}
-    for aa in (interview_session.answer_analyses or []):
-        analyses_by_qid[aa.question_id] = aa
+    approved_plan = await session.scalar(plan_stmt)
+    plan_version = approved_plan.version if (approved_plan and isinstance(approved_plan, InterviewPlan)) else 1
 
     # Match candidate answer messages to questions
     messages = sorted(interview_session.messages or [], key=lambda m: m.sequence_number)
     questions = sorted(interview_session.questions or [], key=lambda q: q.sequence_number)
 
-    candidate_answers_by_qid: dict[UUID, InterviewMessage] = {}
-    for idx, q in enumerate(questions):
-        # Find candidate messages following this question
-        for m in messages:
-            if m.role == "CANDIDATE" and m.sequence_number > q.sequence_number:
-                # Associate if not already taken
-                if q.id not in candidate_answers_by_qid:
-                    candidate_answers_by_qid[q.id] = m
-                    break
-
-    # 6. Build Question-Level Findings
-    question_findings: list[dict[str, Any]] = []
-    follow_up_findings: list[dict[str, Any]] = []
-    cap_evidence_map: dict[str, list[dict[str, Any]]] = {}
-
-    for q in questions:
-        ans_msg = candidate_answers_by_qid.get(q.id)
-        ans_analysis = analyses_by_qid.get(q.id)
-        analysis_data = ans_analysis.analysis if ans_analysis else {}
-
-        ans_quality = analysis_data.get("answer_quality", "SUFFICIENT" if ans_msg else None)
-        ev_state = analysis_data.get("evidence_state", "DEMONSTRATED" if ans_quality == "SUFFICIENT" else "UNKNOWN")
-        key_findings = analysis_data.get("key_findings", [])
-        missing_points = analysis_data.get("missing_points", [])
-        follow_up_needed = analysis_data.get("follow_up_needed", False)
-        follow_up_reason = analysis_data.get("follow_up_reason")
-
-        what_demonstrated = ", ".join(key_findings) if key_findings else (
-            "Demonstrated relevant technical competency during discussion." if ans_msg else None
-        )
-        what_uncertain = ", ".join(missing_points) if missing_points else (
-            "Follow-up clarification recommended." if follow_up_needed else None
-        )
-
-        sources = [{"type": "INTERVIEW_QUESTION", "id": str(q.id)}]
-        if ans_msg:
-            sources.append({"type": "INTERVIEW_MESSAGE", "id": str(ans_msg.id)})
-        if ans_analysis:
-            sources.append({"type": "INTERVIEW_ANSWER_ANALYSIS", "id": str(ans_analysis.id)})
-
-        q_finding = PostInterviewQuestionFinding(
-            question_id=str(q.id),
-            sequence_number=q.sequence_number,
-            question_text=q.question,
-            concept=q.concept,
-            answer_id=str(ans_msg.id) if ans_msg else None,
-            candidate_answer=ans_msg.content if ans_msg else None,
-            answer_quality=ans_quality,
-            evidence_state=ev_state,
-            reasoning=follow_up_reason or (f"Evaluated concept: {q.concept}" if q.concept else None),
-            follow_up_question=q.question if q.question_type == "FOLLOW_UP" else None,
-            what_was_demonstrated=what_demonstrated,
-            what_remains_uncertain=what_uncertain,
-            source_references=sources,
-        )
-        q_finding_dict = q_finding.model_dump()
-        question_findings.append(q_finding_dict)
-
-        if q.question_type == "FOLLOW_UP" or follow_up_needed:
-            follow_up_findings.append(q_finding_dict)
-
-        # Track capability observations
-        if q.concept:
-            cap_evidence_map.setdefault(q.concept.lower(), []).append(q_finding_dict)
-        if q.capability_id:
-            cap_evidence_map.setdefault(str(q.capability_id), []).append(q_finding_dict)
-
-    # 7. Synthesize Capability-Level Findings with Provenance Preservation
-    demonstrated_capabilities: list[dict[str, Any]] = []
-    claimed_capabilities: list[dict[str, Any]] = []
-    unknown_capabilities: list[dict[str, Any]] = []
-    verification_needed: list[dict[str, Any]] = []
-    evidence_findings: list[dict[str, Any]] = []
-
-    # Map pre-interview capabilities
-    pre_claims_map = {c["capability_name"].lower(): c for c in pre_analysis.candidate_claims}
-    pre_strengths_map = {s["capability_name"].lower(): s for s in pre_analysis.candidate_strengths}
-    pre_unknowns_map = {u["capability_name"].lower(): u for u in pre_analysis.candidate_unknowns}
-
-    for cap in job_capabilities:
-        cap_name_clean = cap.name.lower()
-        tested_observations = cap_evidence_map.get(cap_name_clean, []) or cap_evidence_map.get(str(cap.id), [])
-
-        # Determine pre-interview provenance
-        if cap_name_clean in pre_strengths_map:
-            pre_prov = "DEMONSTRATED"
-        elif cap_name_clean in pre_claims_map:
-            pre_prov = "CLAIM"
-        elif cap_name_clean in pre_unknowns_map:
-            pre_prov = "UNKNOWN"
-        else:
-            pre_prov = "UNKNOWN"
-
-        # Determine post-interview provenance without unjustified upgrades
-        has_sufficient_answers = any(
-            obs.get("answer_quality") == "SUFFICIENT" or obs.get("evidence_state") == "DEMONSTRATED"
-            for obs in tested_observations
-        )
-        has_insufficient_answers = any(
-            obs.get("answer_quality") == "INSUFFICIENT"
-            for obs in tested_observations
-        )
-        has_partial_answers = any(
-            obs.get("answer_quality") == "PARTIAL" or obs.get("evidence_state") == "VERIFICATION_NEEDED"
-            for obs in tested_observations
-        )
-
-        source_refs = [{"type": "CAPABILITY", "id": str(cap.id), "name": cap.name}]
-        for obs in tested_observations:
-            source_refs.extend(obs.get("source_references", []))
-
-        if tested_observations:
-            if has_sufficient_answers and not has_insufficient_answers:
-                post_prov = "DEMONSTRATED"
-                strength = "STRONG"
-                obs_text = f"Candidate demonstrated clear competency in {cap.name} with grounded answers."
-                is_verified = True
-            elif has_insufficient_answers:
-                post_prov = "INSUFFICIENT"
-                strength = "INSUFFICIENT"
-                obs_text = f"Candidate was probed on {cap.name} but answer was insufficient."
-                is_verified = False
-            elif has_partial_answers:
-                post_prov = "VERIFICATION_NEEDED"
-                strength = "MODERATE"
-                obs_text = f"Candidate demonstrated partial familiarity with {cap.name}; additional verification suggested."
-                is_verified = False
-            else:
-                post_prov = pre_prov
-                strength = "MODERATE" if pre_prov == "CLAIM" else "INSUFFICIENT"
-                obs_text = f"Probed during interview with inconclusive evidence."
-                is_verified = False
-        else:
-            # Not probed in interview: Preserve pre-interview state!
-            post_prov = pre_prov
-            strength = "MODERATE" if pre_prov == "CLAIM" else "INSUFFICIENT"
-            obs_text = (
-                f"Resume claim noted; not evaluated in this live interview round."
-                if pre_prov == "CLAIM"
-                else f"No prior evidence or live interview verification for {cap.name} (not a failure)."
-            )
-            is_verified = False
-
-        finding = PostInterviewCapabilityFinding(
-            capability_id=str(cap.id),
-            capability_name=cap.name,
-            pre_interview_provenance=pre_prov,
-            post_interview_provenance=post_prov,
-            evidence_strength=strength,
-            observation=obs_text,
-            is_verified_in_interview=is_verified,
-            source_references=source_refs,
-        )
-        finding_dict = finding.model_dump()
-        evidence_findings.append(finding_dict)
-
-        if post_prov == "DEMONSTRATED":
-            demonstrated_capabilities.append(finding_dict)
-        elif post_prov == "CLAIM":
-            claimed_capabilities.append(finding_dict)
-        elif post_prov in ("UNKNOWN", "INSUFFICIENT"):
-            unknown_capabilities.append(finding_dict)
-        elif post_prov == "VERIFICATION_NEEDED":
-            verification_needed.append(finding_dict)
-
-    # 8. Build Round Summaries
-    round_summaries: list[dict[str, Any]] = []
-    rounds_stmt = select(InterviewRound).where(InterviewRound.job_id == job.id).order_by(InterviewRound.sequence.asc())
-    raw_rounds = (await session.scalars(rounds_stmt)).all()
-    db_rounds = [r for r in raw_rounds if isinstance(r, InterviewRound)]
-
-    if db_rounds:
-        for r in db_rounds:
-            r_questions = [q for q in questions if getattr(q, "round_id", None) == r.id or True]
-            r_concepts = [q.concept for q in r_questions if q.concept]
-            round_summaries.append(
-                PostInterviewRoundSummary(
-                    round_id=str(r.id),
-                    round_name=getattr(r, "title", f"Round {getattr(r, 'sequence', 1)}"),
-                    round_type=getattr(r, "round_type", "TECHNICAL"),
-                    sequence=getattr(r, "sequence", 1),
-                    status="COMPLETED",
-                    capabilities_tested=list(set(r_concepts)),
-                    questions_asked=len(r_questions),
-                    followups_used=len([q for q in r_questions if q.question_type == "FOLLOW_UP"]),
-                    evidence_observed=[f for f in demonstrated_capabilities if f["capability_name"] in r_concepts],
-                    unknowns_remaining=[f["capability_name"] for f in unknown_capabilities if f["capability_name"] in r_concepts],
-                ).model_dump()
-            )
-    else:
-        # Default single technical round summary
-        round_summaries.append(
-            PostInterviewRoundSummary(
-                round_id="default-round-1",
-                round_name="Technical & Problem Solving Assessment",
-                round_type="TECHNICAL",
-                sequence=1,
-                status="COMPLETED",
-                capabilities_tested=[q.concept for q in questions if q.concept],
-                questions_asked=len(questions),
-                followups_used=len(follow_up_findings),
-                evidence_observed=demonstrated_capabilities,
-                unknowns_remaining=[u["capability_name"] for u in unknown_capabilities],
-            ).model_dump()
-        )
-
-    # 9. Build Integrity Section (Neutral factual telemetry without accusations)
-    integrity_events = interview_session.integrity_events or []
-    event_counts: dict[str, int] = {}
-    event_timestamps: dict[str, list[str]] = {}
-    event_evidence_refs: dict[str, list[str]] = {}
-    event_evidence_urls: dict[str, list[str]] = {}
-
-    for evt in integrity_events:
-        event_counts[evt.event_type] = event_counts.get(evt.event_type, 0) + 1
-        ts = evt.occurred_at.isoformat() if evt.occurred_at else datetime.now(timezone.utc).isoformat()
-        event_timestamps.setdefault(evt.event_type, []).append(ts)
-        meta = evt.metadata_json or {}
-        if meta.get("evidence_reference"):
-            event_evidence_refs.setdefault(evt.event_type, []).append(str(meta["evidence_reference"]))
-        if meta.get("evidence_url"):
-            event_evidence_urls.setdefault(evt.event_type, []).append(str(meta["evidence_url"]))
-
-    integrity_obs_list: list[PostInterviewIntegrityObservation] = []
-    for evt_type, count in event_counts.items():
-        if evt_type == "PHONE_DETECTED":
-            summary_msg = f"{count} mobile phone detection observation(s) recorded."
-        elif evt_type == "MULTIPLE_PERSONS_DETECTED":
-            summary_msg = f"{count} multiple people detection observation(s) recorded."
-        else:
-            summary_msg = f"{count} {evt_type} event(s) recorded during session."
-
-        integrity_obs_list.append(
-            PostInterviewIntegrityObservation(
-                event_type=evt_type,
-                count=count,
-                occurred_at_list=event_timestamps.get(evt_type, []),
-                summary=summary_msg,
-                evidence_references=event_evidence_refs.get(evt_type, []),
-                evidence_urls=event_evidence_urls.get(evt_type, []),
-            )
-        )
-
-    disclaimer = "These are automated observations and should be reviewed by a human. They are not automatic findings of misconduct."
-    if integrity_obs_list:
-        integ_summary_text = (
-            f"Total {len(integrity_events)} session telemetry observation(s) recorded. {disclaimer}"
-        )
-    else:
-        integ_summary_text = f"Stable session: No browser anomalies or vision observations recorded. {disclaimer}"
-
-    integrity_summary = PostInterviewIntegritySummary(
-        total_events=len(integrity_events),
-        observations=integrity_obs_list,
-        raw_event_count_by_type=event_counts,
-        summary_text=integ_summary_text,
-    ).model_dump()
-
-    # 10. Synthesize Unresolved Areas & Recommendations for Human Review
-    unresolved_areas: list[dict[str, Any]] = []
-    recommendations: list[dict[str, Any]] = []
-
-    for unk in unknown_capabilities:
-        item = {
-            "capability_name": unk["capability_name"],
-            "pre_interview_provenance": unk["pre_interview_provenance"],
-            "detail": f"No live evidence collected for {unk['capability_name']}. Not a verified weakness.",
+    # 4. Extract raw transcript with timestamps
+    raw_transcript = [
+        {
+            "role": m.role,
+            "content": m.content,
+            "sequence_number": m.sequence_number,
+            "timestamp": m.created_at.isoformat() if m.created_at else None,
         }
-        unresolved_areas.append(item)
-        recommendations.append(
-            PostInterviewHumanRecommendation(
-                category="UNRESOLVED_AREA",
-                topic=unk["capability_name"],
-                detail="Consider probing in next round or reviewing code artifacts.",
-                provenance_reference=unk.get("capability_id"),
-            ).model_dump()
+        for m in messages
+    ]
+
+    # 5. Extract media & detector telemetry
+    media_event_types = {
+        "CAMERA_CONNECTED", "CAMERA_DISCONNECTED", "CAMERA_MUTED",
+        "MICROPHONE_CONNECTED", "MICROPHONE_DISCONNECTED", "MICROPHONE_MUTED",
+        "MEDIA_RECOVERY_STARTED", "MEDIA_RECOVERY_FAILED", "DETECTOR_UNAVAILABLE"
+    }
+    media_events = [
+        {
+            "event_type": e.event_type,
+            "occurred_at": e.occurred_at.isoformat() if e.occurred_at else None,
+            "metadata": e.metadata_json or {},
+        }
+        for e in (interview_session.integrity_events or [])
+        if e.event_type in media_event_types
+    ]
+
+    # 6. Extract unanswered questions from approved plan
+    asked_plan_ids = {q.plan_question_id for q in questions if q.plan_question_id is not None}
+    asked_texts = {q.question.strip().lower() for q in questions if q.question}
+    unanswered_questions = []
+    if approved_plan and isinstance(approved_plan, InterviewPlan) and approved_plan.rounds:
+        for r in approved_plan.rounds:
+            for pq in (r.questions or []):
+                if pq.id not in asked_plan_ids and pq.question_text.strip().lower() not in asked_texts:
+                    unanswered_questions.append({
+                        "plan_question_id": str(pq.id),
+                        "round_number": r.round_number,
+                        "round_title": r.title,
+                        "concept": pq.concept,
+                        "question_text": pq.question_text,
+                        "status": "UNANSWERED_NOT_REACHED",
+                    })
+
+    # 7. Extract existing scorecard data
+    sc_stmt = (
+        select(CandidateScorecard)
+        .where(
+            CandidateScorecard.application_id == application.id,
+            CandidateScorecard.scorecard_type == "POST_INTERVIEW",
         )
+        .order_by(CandidateScorecard.created_at.desc())
+    )
+    scorecard_rec = await session.scalar(sc_stmt)
+    scorecard_dict = scorecard_rec.scorecard_data if (scorecard_rec and isinstance(scorecard_rec, CandidateScorecard)) else None
 
-    for ver in verification_needed:
-        recommendations.append(
-            PostInterviewHumanRecommendation(
-                category="VERIFICATION_SUGGESTION",
-                topic=ver["capability_name"],
-                detail=f"Partial evidence demonstrated; suggest focused technical validation for {ver['capability_name']}.",
-                provenance_reference=ver.get("capability_id"),
-            ).model_dump()
-        )
-
-    for dem in demonstrated_capabilities:
-        recommendations.append(
-            PostInterviewHumanRecommendation(
-                category="STRENGTH",
-                topic=dem["capability_name"],
-                detail=f"Strong demonstrated evidence during live Q&A in {dem['capability_name']}.",
-                provenance_reference=dem.get("capability_id"),
-            ).model_dump()
-        )
-
-    # 11. Structured Executive Summary (Human-in-the-loop, no AI hire/reject score)
-    dem_names = [d["capability_name"] for d in demonstrated_capabilities]
-    unk_names = [u["capability_name"] for u in unknown_capabilities]
-
-    summary_parts = []
-    if dem_names:
-        summary_parts.append(f"Candidate demonstrated verified competency in: {', '.join(dem_names)}.")
-    if claimed_capabilities:
-        claim_names = [c["capability_name"] for c in claimed_capabilities]
-        summary_parts.append(f"Retained resume claims for: {', '.join(claim_names)}.")
-    if unk_names:
-        summary_parts.append(f"Remaining areas with unverified evidence: {', '.join(unk_names)}.")
-    summary_parts.append("Final hiring decision rests with the recruiter/hiring manager.")
-
-    final_summary = " ".join(summary_parts)
-
-    # 12. Persist or Update InterviewReportModel
+    # STAGE 1: Immediate Raw Evidence Persistence (prevents loss if AI fails)
+    now_utc = datetime.now(timezone.utc)
     report_stmt = select(InterviewReportModel).where(
         InterviewReportModel.interview_session_id == session_id
     )
-    existing_report = await session.scalar(report_stmt)
+    report_obj = await session.scalar(report_stmt)
 
-    now_utc = datetime.now(timezone.utc)
+    if not isinstance(report_obj, InterviewReportModel):
+        report_obj = InterviewReportModel(
+            interview_session_id=session_id,
+            status="GENERATING_REPORT",
+            generated_at=now_utc,
+            generation_source=generation_source,
+            completion_reason=interview_session.completion_reason or "COMPLETED",
+            configured_duration_minutes=interview_session.duration_minutes or 30,
+            transcript=raw_transcript,
+            unanswered_questions=unanswered_questions,
+            media_events=media_events,
+            scorecard_data=scorecard_dict,
+            metadata_json={"total_questions": len(questions), "total_messages": len(messages), "plan_version": plan_version},
+            created_at=now_utc,
+            updated_at=now_utc,
+        )
+        session.add(report_obj)
+    else:
+        report_obj.status = "GENERATING_REPORT"
+        report_obj.completion_reason = interview_session.completion_reason or "COMPLETED"
+        report_obj.configured_duration_minutes = interview_session.duration_minutes or 30
+        report_obj.transcript = raw_transcript
+        report_obj.unanswered_questions = unanswered_questions
+        report_obj.media_events = media_events
+        report_obj.scorecard_data = scorecard_dict
+        report_obj.updated_at = now_utc
 
-    if isinstance(existing_report, InterviewReportModel):
-        report_obj = existing_report
-        report_obj.status = "COMPLETED"
-        report_obj.generated_at = now_utc
-        report_obj.generation_source = generation_source
+    interview_session.report_status = "GENERATING_REPORT"
+    await session.commit()
+    await session.refresh(report_obj)
+
+    # STAGE 2: AI Report Synthesis
+    try:
+        # Load pre-interview analysis for grounded baseline
+        pre_analysis = await build_candidate_interview_pre_analysis(
+            session=session,
+            application_id=application.id,
+            organization_id=organization_id,
+        )
+
+        analyses_by_qid: dict[UUID, InterviewAnswerAnalysis] = {}
+        for aa in (interview_session.answer_analyses or []):
+            analyses_by_qid[aa.question_id] = aa
+
+        candidate_answers_by_qid: dict[UUID, InterviewMessage] = {}
+        for idx, q in enumerate(questions):
+            # Find candidate messages following this question
+            for m in messages:
+                if m.role == "CANDIDATE" and m.sequence_number > q.sequence_number:
+                    # Associate if not already taken
+                    if q.id not in candidate_answers_by_qid:
+                        candidate_answers_by_qid[q.id] = m
+                        break
+
+        # 6. Build Question-Level Findings
+        question_findings: list[dict[str, Any]] = []
+        follow_up_findings: list[dict[str, Any]] = []
+        cap_evidence_map: dict[str, list[dict[str, Any]]] = {}
+
+        for q in questions:
+            ans_msg = candidate_answers_by_qid.get(q.id)
+            ans_analysis = analyses_by_qid.get(q.id)
+            analysis_data = ans_analysis.analysis if ans_analysis else {}
+
+            ans_quality = analysis_data.get("answer_quality", "SUFFICIENT" if ans_msg else None)
+            ev_state = analysis_data.get("evidence_state", "DEMONSTRATED" if ans_quality == "SUFFICIENT" else "UNKNOWN")
+            key_findings = analysis_data.get("key_findings", [])
+            missing_points = analysis_data.get("missing_points", [])
+            follow_up_needed = analysis_data.get("follow_up_needed", False)
+            follow_up_reason = analysis_data.get("follow_up_reason")
+
+            what_demonstrated = ", ".join(key_findings) if key_findings else (
+                "Demonstrated relevant technical competency during discussion." if ans_msg else None
+            )
+            what_uncertain = ", ".join(missing_points) if missing_points else (
+                "Follow-up clarification recommended." if follow_up_needed else None
+            )
+
+            sources = [{"type": "INTERVIEW_QUESTION", "id": str(q.id)}]
+            if ans_msg:
+                sources.append({"type": "INTERVIEW_MESSAGE", "id": str(ans_msg.id)})
+            if ans_analysis:
+                sources.append({"type": "INTERVIEW_ANSWER_ANALYSIS", "id": str(ans_analysis.id)})
+
+            q_finding = PostInterviewQuestionFinding(
+                question_id=str(q.id),
+                sequence_number=q.sequence_number,
+                question_text=q.question,
+                concept=q.concept,
+                answer_id=str(ans_msg.id) if ans_msg else None,
+                candidate_answer=ans_msg.content if ans_msg else None,
+                answer_quality=ans_quality,
+                evidence_state=ev_state,
+                reasoning=follow_up_reason or (f"Evaluated concept: {q.concept}" if q.concept else None),
+                follow_up_question=q.question if q.question_type == "FOLLOW_UP" else None,
+                what_was_demonstrated=what_demonstrated,
+                what_remains_uncertain=what_uncertain,
+                source_references=sources,
+            )
+            q_finding_dict = q_finding.model_dump()
+            question_findings.append(q_finding_dict)
+
+            if q.question_type == "FOLLOW_UP" or follow_up_needed:
+                follow_up_findings.append(q_finding_dict)
+
+            # Track capability observations
+            if q.concept:
+                cap_evidence_map.setdefault(q.concept.lower(), []).append(q_finding_dict)
+            if q.capability_id:
+                cap_evidence_map.setdefault(str(q.capability_id), []).append(q_finding_dict)
+
+        # 7. Synthesize Capability-Level Findings with Provenance Preservation
+        demonstrated_capabilities: list[dict[str, Any]] = []
+        claimed_capabilities: list[dict[str, Any]] = []
+        unknown_capabilities: list[dict[str, Any]] = []
+        verification_needed: list[dict[str, Any]] = []
+        evidence_findings: list[dict[str, Any]] = []
+
+        # Map pre-interview capabilities
+        pre_claims_map = {c["capability_name"].lower(): c for c in pre_analysis.candidate_claims}
+        pre_strengths_map = {s["capability_name"].lower(): s for s in pre_analysis.candidate_strengths}
+        pre_unknowns_map = {u["capability_name"].lower(): u for u in pre_analysis.candidate_unknowns}
+
+        for cap in job_capabilities:
+            cap_name_clean = cap.name.lower()
+            tested_observations = cap_evidence_map.get(cap_name_clean, []) or cap_evidence_map.get(str(cap.id), [])
+
+            # Determine pre-interview provenance
+            if cap_name_clean in pre_strengths_map:
+                pre_prov = "DEMONSTRATED"
+            elif cap_name_clean in pre_claims_map:
+                pre_prov = "CLAIM"
+            elif cap_name_clean in pre_unknowns_map:
+                pre_prov = "UNKNOWN"
+            else:
+                pre_prov = "UNKNOWN"
+
+            # Determine post-interview provenance without unjustified upgrades
+            has_sufficient_answers = any(
+                obs.get("answer_quality") == "SUFFICIENT" or obs.get("evidence_state") == "DEMONSTRATED"
+                for obs in tested_observations
+            )
+            has_insufficient_answers = any(
+                obs.get("answer_quality") == "INSUFFICIENT"
+                for obs in tested_observations
+            )
+            has_partial_answers = any(
+                obs.get("answer_quality") == "PARTIAL" or obs.get("evidence_state") == "VERIFICATION_NEEDED"
+                for obs in tested_observations
+            )
+
+            source_refs = [{"type": "CAPABILITY", "id": str(cap.id), "name": cap.name}]
+            for obs in tested_observations:
+                source_refs.extend(obs.get("source_references", []))
+
+            if tested_observations:
+                if has_sufficient_answers and not has_insufficient_answers:
+                    post_prov = "DEMONSTRATED"
+                    strength = "STRONG"
+                    obs_text = f"Candidate demonstrated clear competency in {cap.name} with grounded answers."
+                    is_verified = True
+                elif has_insufficient_answers:
+                    post_prov = "INSUFFICIENT"
+                    strength = "INSUFFICIENT"
+                    obs_text = f"Candidate was probed on {cap.name} but answer was insufficient."
+                    is_verified = False
+                elif has_partial_answers:
+                    post_prov = "VERIFICATION_NEEDED"
+                    strength = "MODERATE"
+                    obs_text = f"Candidate demonstrated partial familiarity with {cap.name}; additional verification suggested."
+                    is_verified = False
+                else:
+                    post_prov = pre_prov
+                    strength = "MODERATE" if pre_prov == "CLAIM" else "INSUFFICIENT"
+                    obs_text = f"Probed during interview with inconclusive evidence."
+                    is_verified = False
+            else:
+                # Not probed in interview: Preserve pre-interview state!
+                post_prov = pre_prov
+                strength = "MODERATE" if pre_prov == "CLAIM" else "INSUFFICIENT"
+                obs_text = (
+                    f"Resume claim noted; not evaluated in this live interview round."
+                    if pre_prov == "CLAIM"
+                    else f"No prior evidence or live interview verification for {cap.name} (not a failure)."
+                )
+                is_verified = False
+
+            finding = PostInterviewCapabilityFinding(
+                capability_id=str(cap.id),
+                capability_name=cap.name,
+                pre_interview_provenance=pre_prov,
+                post_interview_provenance=post_prov,
+                evidence_strength=strength,
+                observation=obs_text,
+                is_verified_in_interview=is_verified,
+                source_references=source_refs,
+            )
+            finding_dict = finding.model_dump()
+            evidence_findings.append(finding_dict)
+
+            if post_prov == "DEMONSTRATED":
+                demonstrated_capabilities.append(finding_dict)
+            elif post_prov == "CLAIM":
+                claimed_capabilities.append(finding_dict)
+            elif post_prov in ("UNKNOWN", "INSUFFICIENT"):
+                unknown_capabilities.append(finding_dict)
+            elif post_prov == "VERIFICATION_NEEDED":
+                verification_needed.append(finding_dict)
+
+        # 8. Build Round Summaries
+        round_summaries: list[dict[str, Any]] = []
+        rounds_stmt = select(InterviewRound).where(InterviewRound.job_id == job.id).order_by(InterviewRound.sequence.asc())
+        raw_rounds = (await session.scalars(rounds_stmt)).all()
+        db_rounds = [r for r in raw_rounds if isinstance(r, InterviewRound)]
+
+        if db_rounds:
+            for r in db_rounds:
+                r_questions = [q for q in questions if getattr(q, "round_id", None) == r.id or True]
+                r_concepts = [q.concept for q in r_questions if q.concept]
+                round_summaries.append(
+                    PostInterviewRoundSummary(
+                        round_id=str(r.id),
+                        round_name=getattr(r, "title", f"Round {getattr(r, 'sequence', 1)}"),
+                        round_type=getattr(r, "round_type", "TECHNICAL"),
+                        sequence=getattr(r, "sequence", 1),
+                        status="COMPLETED",
+                        capabilities_tested=list(set(r_concepts)),
+                        questions_asked=len(r_questions),
+                        followups_used=len([q for q in r_questions if q.question_type == "FOLLOW_UP"]),
+                        evidence_observed=[f for f in demonstrated_capabilities if f["capability_name"] in r_concepts],
+                        unknowns_remaining=[f["capability_name"] for f in unknown_capabilities if f["capability_name"] in r_concepts],
+                    ).model_dump()
+                )
+        else:
+            # Default single technical round summary
+            round_summaries.append(
+                PostInterviewRoundSummary(
+                    round_id="default-round-1",
+                    round_name="Technical & Problem Solving Assessment",
+                    round_type="TECHNICAL",
+                    sequence=1,
+                    status="COMPLETED",
+                    capabilities_tested=[q.concept for q in questions if q.concept],
+                    questions_asked=len(questions),
+                    followups_used=len(follow_up_findings),
+                    evidence_observed=demonstrated_capabilities,
+                    unknowns_remaining=[u["capability_name"] for u in unknown_capabilities],
+                ).model_dump()
+            )
+
+        # 9. Build Integrity Section (Neutral factual telemetry without accusations)
+        integrity_events = interview_session.integrity_events or []
+        event_counts: dict[str, int] = {}
+        event_timestamps: dict[str, list[str]] = {}
+        event_evidence_refs: dict[str, list[str]] = {}
+        event_evidence_urls: dict[str, list[str]] = {}
+
+        for evt in integrity_events:
+            event_counts[evt.event_type] = event_counts.get(evt.event_type, 0) + 1
+            ts = evt.occurred_at.isoformat() if evt.occurred_at else datetime.now(timezone.utc).isoformat()
+            event_timestamps.setdefault(evt.event_type, []).append(ts)
+            meta = evt.metadata_json or {}
+            if meta.get("evidence_reference"):
+                event_evidence_refs.setdefault(evt.event_type, []).append(str(meta["evidence_reference"]))
+            if meta.get("evidence_url"):
+                event_evidence_urls.setdefault(evt.event_type, []).append(str(meta["evidence_url"]))
+
+        integrity_obs_list: list[PostInterviewIntegrityObservation] = []
+        for evt_type, count in event_counts.items():
+            if evt_type == "PHONE_DETECTED":
+                summary_msg = f"{count} mobile phone detection observation(s) recorded."
+            elif evt_type == "MULTIPLE_PERSONS_DETECTED":
+                summary_msg = f"{count} multiple people detection observation(s) recorded."
+            else:
+                summary_msg = f"{count} {evt_type} event(s) recorded during session."
+
+            integrity_obs_list.append(
+                PostInterviewIntegrityObservation(
+                    event_type=evt_type,
+                    count=count,
+                    occurred_at_list=event_timestamps.get(evt_type, []),
+                    summary=summary_msg,
+                    evidence_references=event_evidence_refs.get(evt_type, []),
+                    evidence_urls=event_evidence_urls.get(evt_type, []),
+                )
+            )
+
+        disclaimer = "These are automated observations and should be reviewed by a human. They are not automatic findings of misconduct."
+        if integrity_obs_list:
+            integ_summary_text = (
+                f"Total {len(integrity_events)} session telemetry observation(s) recorded. {disclaimer}"
+            )
+        else:
+            integ_summary_text = f"Stable session: No browser anomalies or vision observations recorded. {disclaimer}"
+
+        integrity_summary = PostInterviewIntegritySummary(
+            total_events=len(integrity_events),
+            observations=integrity_obs_list,
+            raw_event_count_by_type=event_counts,
+            summary_text=integ_summary_text,
+        ).model_dump()
+
+        # 10. Synthesize Unresolved Areas & Recommendations for Human Review
+        unresolved_areas: list[dict[str, Any]] = []
+        recommendations: list[dict[str, Any]] = []
+
+        for unk in unknown_capabilities:
+            item = {
+                "capability_name": unk["capability_name"],
+                "pre_interview_provenance": unk["pre_interview_provenance"],
+                "detail": f"No live evidence collected for {unk['capability_name']}. Not a verified weakness.",
+            }
+            unresolved_areas.append(item)
+            recommendations.append(
+                PostInterviewHumanRecommendation(
+                    category="UNRESOLVED_AREA",
+                    topic=unk["capability_name"],
+                    detail="Consider probing in next round or reviewing code artifacts.",
+                    provenance_reference=unk.get("capability_id"),
+                ).model_dump()
+            )
+
+        for ver in verification_needed:
+            recommendations.append(
+                PostInterviewHumanRecommendation(
+                    category="VERIFICATION_SUGGESTION",
+                    topic=ver["capability_name"],
+                    detail=f"Partial evidence demonstrated; suggest focused technical validation for {ver['capability_name']}.",
+                    provenance_reference=ver.get("capability_id"),
+                ).model_dump()
+            )
+
+        for dem in demonstrated_capabilities:
+            recommendations.append(
+                PostInterviewHumanRecommendation(
+                    category="STRENGTH",
+                    topic=dem["capability_name"],
+                    detail=f"Strong demonstrated evidence during live Q&A in {dem['capability_name']}.",
+                    provenance_reference=dem.get("capability_id"),
+                ).model_dump()
+            )
+
+        # 11. Structured Executive Summary (Human-in-the-loop, no AI hire/reject score)
+        dem_names = [d["capability_name"] for d in demonstrated_capabilities]
+        unk_names = [u["capability_name"] for u in unknown_capabilities]
+
+        summary_parts = []
+        if dem_names:
+            summary_parts.append(f"Candidate demonstrated verified competency in: {', '.join(dem_names)}.")
+        if claimed_capabilities:
+            claim_names = [c["capability_name"] for c in claimed_capabilities]
+            summary_parts.append(f"Retained resume claims for: {', '.join(claim_names)}.")
+        if unk_names:
+            summary_parts.append(f"Remaining areas with unverified evidence: {', '.join(unk_names)}.")
+        summary_parts.append("Final hiring decision rests with the recruiter/hiring manager.")
+
+        final_summary = " ".join(summary_parts)
+
+        # Determine success status: COMPLETED or COMPLETED_WITH_WARNINGS
+        has_warnings = (
+            interview_session.completion_reason in ("INTERRUPTED_MEDIA_FAILURE", "TIME_EXPIRED")
+            or len(unanswered_questions) > 0
+            or any(e.event_type == "DETECTOR_UNAVAILABLE" for e in (interview_session.integrity_events or []))
+        )
+        resolved_status = "COMPLETED_WITH_WARNINGS" if has_warnings else "COMPLETED"
+
+        report_obj.status = resolved_status
+        report_obj.generated_at = datetime.now(timezone.utc)
         report_obj.summary = final_summary
         report_obj.strengths = pre_analysis.candidate_strengths
         report_obj.demonstrated_capabilities = demonstrated_capabilities
@@ -452,35 +562,24 @@ async def generate_and_persist_interview_report(
         report_obj.integrity_summary = integrity_summary
         report_obj.unresolved_areas = unresolved_areas
         report_obj.recommendations_for_human_review = recommendations
-        report_obj.updated_at = now_utc
-    else:
-        report_obj = InterviewReportModel(
-            interview_session_id=session_id,
-            status="COMPLETED",
-            generated_at=now_utc,
-            generation_source=generation_source,
-            summary=final_summary,
-            strengths=pre_analysis.candidate_strengths,
-            demonstrated_capabilities=demonstrated_capabilities,
-            claimed_capabilities=claimed_capabilities,
-            unknown_capabilities=unknown_capabilities,
-            verification_needed=verification_needed,
-            evidence_findings=evidence_findings,
-            round_summaries=round_summaries,
-            question_findings=question_findings,
-            follow_up_findings=follow_up_findings,
-            integrity_summary=integrity_summary,
-            unresolved_areas=unresolved_areas,
-            recommendations_for_human_review=recommendations,
-            metadata_json={"total_questions": len(questions), "total_messages": len(messages)},
-            created_at=now_utc,
-            updated_at=now_utc,
-        )
-        session.add(report_obj)
+        report_obj.failure_reason = None
+        report_obj.updated_at = datetime.now(timezone.utc)
 
-    await session.commit()
-    await session.refresh(report_obj)
-    logger.info(f"Successfully generated and persisted InterviewReport for session {session_id}.")
+        interview_session.report_status = resolved_status
+        await session.commit()
+        await session.refresh(report_obj)
+        logger.info(f"Successfully generated and persisted InterviewReport for session {session_id} with status {resolved_status}.")
+
+    except Exception as ai_exc:
+        logger.error(f"Error during AI report synthesis for session {session_id}: {ai_exc}", exc_info=True)
+        report_obj.status = "REPORT_FAILED"
+        report_obj.failure_reason = str(ai_exc)
+        report_obj.summary = f"Automated AI report synthesis failed: {ai_exc}. All raw questions, answers, and telemetry have been preserved."
+        report_obj.updated_at = datetime.now(timezone.utc)
+        interview_session.report_status = "REPORT_FAILED"
+        await session.commit()
+        await session.refresh(report_obj)
+
     return report_obj
 
 
@@ -528,30 +627,30 @@ async def build_interview_report_response(
 
     # Format capability breakdown for UI compatibility
     caps_breakdown = []
-    for d in report_obj.demonstrated_capabilities:
+    for d in (report_obj.demonstrated_capabilities or []):
         caps_breakdown.append({
-            "capability": d["capability_name"],
+            "capability": d.get("capability_name", "Technical Competency"),
             "level": "STRONG",
             "provenance": "DEMONSTRATED",
             "note": d.get("observation", ""),
         })
-    for c in report_obj.claimed_capabilities:
+    for c in (report_obj.claimed_capabilities or []):
         caps_breakdown.append({
-            "capability": c["capability_name"],
+            "capability": c.get("capability_name", "Claimed Competency"),
             "level": "MODERATE",
             "provenance": "CLAIM",
             "note": c.get("observation", ""),
         })
-    for v in report_obj.verification_needed:
+    for v in (report_obj.verification_needed or []):
         caps_breakdown.append({
-            "capability": v["capability_name"],
+            "capability": v.get("capability_name", "Verification Needed"),
             "level": "MODERATE",
             "provenance": "VERIFICATION_NEEDED",
             "note": v.get("observation", ""),
         })
-    for u in report_obj.unknown_capabilities:
+    for u in (report_obj.unknown_capabilities or []):
         caps_breakdown.append({
-            "capability": u["capability_name"],
+            "capability": u.get("capability_name", "Unknown Competency"),
             "level": "INSUFFICIENT",
             "provenance": "UNKNOWN",
             "note": u.get("observation", ""),
@@ -567,6 +666,11 @@ async def build_interview_report_response(
                 "rating": qf.get("answer_quality", "Evaluated"),
             })
 
+    summary_text = (
+        report_obj.summary
+        or f"Interview evaluation report ({report_obj.status}). Raw transcript and evidence preserved."
+    )
+
     return InterviewReport(
         id=report_obj.id,
         session_id=report_obj.interview_session_id,
@@ -578,8 +682,8 @@ async def build_interview_report_response(
         status=report_obj.status,
         generated_at=report_obj.generated_at,
         generation_source=report_obj.generation_source or "SYSTEM_AI",
-        summary=report_obj.summary,
-        executive_summary=report_obj.summary,
+        summary=summary_text,
+        executive_summary=summary_text,
         strengths=report_obj.strengths or [],
         demonstrated_capabilities=report_obj.demonstrated_capabilities or [],
         claimed_capabilities=report_obj.claimed_capabilities or [],
@@ -593,16 +697,27 @@ async def build_interview_report_response(
         unresolved_areas=report_obj.unresolved_areas or [],
         recommendations_for_human_review=report_obj.recommendations_for_human_review or [],
         metadata_json=report_obj.metadata_json or {},
-        total_questions=len(report_obj.question_findings),
-        total_messages=len(report_obj.question_findings),
+        total_questions=len(report_obj.question_findings or []),
+        total_messages=len(report_obj.transcript or []),
         completed_at=getattr(sess_obj, "ended_at", report_obj.generated_at),
         created_at=report_obj.created_at,
         updated_at=report_obj.updated_at,
-        rounds_completed=len(report_obj.round_summaries),
-        total_rounds=max(len(report_obj.round_summaries), 1),
-        capabilities_explored=[c["capability_name"] for c in report_obj.evidence_findings],
-        questions_asked=len(report_obj.question_findings),
-        remaining_unknowns=[u["capability_name"] for u in report_obj.unknown_capabilities],
+        completion_reason=report_obj.completion_reason or getattr(sess_obj, "completion_reason", None),
+        configured_duration_minutes=report_obj.configured_duration_minutes or getattr(sess_obj, "duration_minutes", None),
+        started_at=getattr(sess_obj, "started_at", None),
+        ended_at=getattr(sess_obj, "ended_at", None),
+        plan_version=(report_obj.metadata_json or {}).get("plan_version", 1),
+        transcript=report_obj.transcript or [],
+        unanswered_questions=report_obj.unanswered_questions or [],
+        media_events=report_obj.media_events or [],
+        scorecard_data=report_obj.scorecard_data,
+        failure_reason=report_obj.failure_reason,
+        report_status=report_obj.status,
+        rounds_completed=len(report_obj.round_summaries or []),
+        total_rounds=max(len(report_obj.round_summaries or []), 1),
+        capabilities_explored=[c.get("capability_name", "") for c in (report_obj.evidence_findings or [])],
+        questions_asked=len(report_obj.question_findings or []),
+        remaining_unknowns=[u.get("capability_name", "") for u in (report_obj.unknown_capabilities or [])],
         capabilities_breakdown=caps_breakdown,
         transcript_highlights=highlights,
     )

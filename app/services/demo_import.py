@@ -79,6 +79,15 @@ def generate_deterministic_demo_email(filename: str, pdf_bytes: bytes) -> str:
     return f"demo.candidate.{h}@demo.gap2hire.local"
 
 
+CAPABILITY_NOISE_WORDS = {
+    "and", "or", "in", "of", "for", "with", "the", "a", "an", "to",
+    "management", "control", "programming", "development", "developer",
+    "engineer", "engineering", "fundamentals", "basics", "basic", "skills",
+    "tools", "framework", "frameworks", "core", "applied", "advanced",
+    "level", "system", "systems", "concepts", "concept", "practices", "practice",
+}
+
+
 def extract_grounded_evidence_for_resume(
     capabilities: Sequence[Capability],
     resume_text: str,
@@ -99,55 +108,108 @@ def extract_grounded_evidence_for_resume(
         cap_name = cap.name.strip()
         cap_lower = cap_name.lower()
 
-        # Word boundary match for capability name
+        # Priority 1: Exact full phrase match
         pattern = r'\b' + re.escape(cap_lower) + r'\b'
         match = re.search(pattern, text_lower)
+        matched_search_term = cap_lower if match else None
 
+        # Priority 2: Comprehensive domain aliases
         if not match:
-            # Check standard aliases (e.g., "REST API" for "REST APIs", "Postgres" for "PostgreSQL")
             aliases = []
-            if "rest api" in cap_lower:
-                aliases = [r'\brest\b', r'\brestful\b', r'\brest apis?\b']
-            elif "postgres" in cap_lower:
-                aliases = [r'\bpostgres\b', r'\bpostgresql\b']
-            elif "docker" in cap_lower:
-                aliases = [r'\bdocker\b', r'\bcontainer(?:s|ization)?\b']
-            elif "fastapi" in cap_lower:
-                aliases = [r'\bfastapi\b']
-            elif "python" in cap_lower:
-                aliases = [r'\bpython\b', r'\bpython3\b']
+            if any(k in cap_lower for k in ["sql", "database", "rdbms"]):
+                aliases.extend([
+                    r'\bsql\b',
+                    r'\bdatabases?\b',
+                    r'\bmysql\b',
+                    r'\bpostgres(?:ql)?\b',
+                    r'\bsqlite\b',
+                    r'\brdbms\b',
+                    r'\bmongodb\b',
+                    r'\boracle\b',
+                ])
+            if any(k in cap_lower for k in ["git", "github", "version control"]):
+                aliases.extend([
+                    r'\bgithub\b',
+                    r'\bgit\b',
+                    r'\bgitlab\b',
+                    r'\bversion control\b',
+                    r'\bbitbucket\b',
+                    r'\bvcs\b',
+                ])
+            if "python" in cap_lower:
+                aliases.extend([
+                    r'\bpython\b',
+                    r'\bpython3\b',
+                    r'\bpy\b',
+                    r'\bflask\b',
+                    r'\bdjango\b',
+                    r'\bfastapi\b',
+                ])
+            if "fastapi" in cap_lower:
+                aliases.extend([r'\bfastapi\b', r'\buvicorn\b', r'\basgi\b'])
+            if any(k in cap_lower for k in ["rest", "api"]):
+                aliases.extend([r'\brest\b', r'\brestful\b', r'\bapis?\b', r'\bendpoints?\b'])
+            if any(k in cap_lower for k in ["docker", "container"]):
+                aliases.extend([r'\bdocker\b', r'\bcontainers?\b', r'\bcontainerization\b', r'\bk8s\b', r'\bkubernetes\b'])
+            if "react" in cap_lower:
+                aliases.extend([r'\breact\b', r'\breactjs\b', r'\bjsx\b', r'\btsx\b'])
+            if any(k in cap_lower for k in ["javascript", "typescript", "node"]):
+                aliases.extend([r'\bjavascript\b', r'\btypescript\b', r'\bnode(?:js)?\b', r'\bjs\b', r'\bts\b'])
+            if any(k in cap_lower for k in ["aws", "cloud"]):
+                aliases.extend([r'\baws\b', r'\bcloud\b', r'\bec2\b', r'\bs3\b', r'\blambda\b', r'\bazure\b', r'\bgcp\b'])
+            if any(k in cap_lower for k in ["distributed", "consensus"]):
+                aliases.extend([r'\bdistributed systems?\b', r'\bconsensus\b', r'\bpaxos\b', r'\braft\b', r'\bconcurrency\b'])
 
             for alias in aliases:
-                match = re.search(alias, text_lower)
-                if match:
+                m = re.search(alias, text_lower)
+                if m:
+                    match = m
+                    matched_search_term = alias
+                    break
+
+        # Priority 3: Sub-token matching (extract individual technical keywords)
+        if not match:
+            tokens = [
+                w
+                for w in re.findall(r'\b[a-zA-Z0-9+#\.]+\b', cap_lower)
+                if w not in CAPABILITY_NOISE_WORDS and len(w) >= 2
+            ]
+            for tok in tokens:
+                m = re.search(r'\b' + re.escape(tok) + r'\b', text_lower)
+                if m:
+                    match = m
+                    matched_search_term = tok
                     break
 
         if match:
             # Locate matching line(s) in resume text
             matched_line = None
             is_project_or_exp = False
-            current_section = ""
 
             for line in lines:
                 l_lower = line.lower()
-                if any(sec in l_lower for sec in ["project", "experience", "work history", "employment"]):
-                    current_section = "PROJECTS"
-                elif any(sec in l_lower for sec in ["skill", "technolog", "proficienc"]):
-                    current_section = "SKILLS"
+                is_line_match = False
+                if re.search(pattern, l_lower):
+                    is_line_match = True
+                elif match and re.search(r'\b' + re.escape(match.group(0)) + r'\b', l_lower):
+                    is_line_match = True
+                elif matched_search_term and re.search(matched_search_term, l_lower):
+                    is_line_match = True
 
-                if re.search(pattern, l_lower) or (match and match.group(0) in l_lower):
+                if is_line_match:
                     matched_line = line
-                    if current_section == "PROJECTS" or "involving" in l_lower or "built" in l_lower or "developed" in l_lower:
+                    if any(sec in l_lower for sec in ["project", "experience", "work history", "built", "developed", "created", "implemented", "application", "tracker"]):
                         is_project_or_exp = True
-                    break
+                        break  # Found project evidence line
 
             if not matched_line:
                 matched_line = f"Mentions {cap_name} in resume."
 
             # Determine strength based on context
-            if is_project_or_exp:
+            line_lower = matched_line.lower()
+            if is_project_or_exp or any(w in line_lower for w in ["built", "developed", "created", "implemented", "project:", "engineered"]):
                 strength = "STRONG"
-            elif "limited" in text_lower or "basic" in text_lower:
+            elif any(w in line_lower for w in ["limited", "basic", "familiar", "exposure", "learning"]):
                 strength = "WEAK"
             else:
                 strength = "MODERATE"

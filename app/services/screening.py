@@ -747,34 +747,50 @@ async def run_job_screening_workflow(
             except Exception as src_err:
                 logger.info(f"Source discovery notice for application {app_obj.id}: {src_err}")
 
-            # 2. Extract resume evidence claims if not yet extracted
-            ev_check = await session.scalars(select(Evidence).where(Evidence.application_id == app_obj.id))
-            if not list(ev_check.all()) and capabilities:
+            # 2. Extract or refresh resume evidence claims for each capability
+            if capabilities:
                 if getattr(app_obj, "is_demo", False):
                     from app.services.demo_import import extract_grounded_evidence_for_resume
                     ev_items = extract_grounded_evidence_for_resume(capabilities, app_obj.resume_text or "")
-                    for item in ev_items:
-                        session.add(
-                            Evidence(
-                                application_id=app_obj.id,
-                                capability_id=item["capability_id"],
-                                candidate_source_id=None,
-                                source_type="RESUME",
-                                strength=item["strength"],
-                                provenance="CLAIM",
-                                content=item["content"],
-                            )
+                    existing_ev_list = list((await session.scalars(
+                        select(Evidence).where(
+                            Evidence.application_id == app_obj.id,
+                            Evidence.source_type == "RESUME",
                         )
+                    )).all())
+                    existing_by_cap = {e.capability_id: e for e in existing_ev_list}
+
+                    for item in ev_items:
+                        cap_id = item["capability_id"]
+                        if cap_id in existing_by_cap:
+                            rec = existing_by_cap[cap_id]
+                            rec.strength = item["strength"]
+                            rec.provenance = "CLAIM"
+                            rec.content = item["content"]
+                        else:
+                            session.add(
+                                Evidence(
+                                    application_id=app_obj.id,
+                                    capability_id=cap_id,
+                                    candidate_source_id=None,
+                                    source_type="RESUME",
+                                    strength=item["strength"],
+                                    provenance="CLAIM",
+                                    content=item["content"],
+                                )
+                            )
                     await session.flush()
                 else:
-                    try:
-                        await analyze_application_evidence(
-                            session=session,
-                            application_id=app_obj.id,
-                            organization_id=organization_id,
-                        )
-                    except Exception as ev_err:
-                        logger.info(f"Resume evidence extraction notice for {app_obj.id}: {ev_err}")
+                    ev_check = await session.scalars(select(Evidence).where(Evidence.application_id == app_obj.id))
+                    if not list(ev_check.all()):
+                        try:
+                            await analyze_application_evidence(
+                                session=session,
+                                application_id=app_obj.id,
+                                organization_id=organization_id,
+                            )
+                        except Exception as ev_err:
+                            logger.info(f"Resume evidence extraction notice for {app_obj.id}: {ev_err}")
 
         # 3. Deep source artifact investigation for repository sources
         # Refresh sources

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +18,7 @@ from app.schemas.interview import (
     InterviewQuestionResponse,
     InterviewSessionDetailResponse,
     InterviewSessionResponse,
+    InterviewStartRequest,
 )
 from app.schemas.interview_analysis import InterviewReport
 from app.schemas.interview_avatar import InterviewAvatarMetadata
@@ -29,11 +30,14 @@ from app.services.ai_interview import AIInterviewError
 from app.services.application import ApplicationNotFoundError
 from app.services.interview import (
     CandidateNotShortlistedError,
+    InterviewExpiredError,
     InterviewQuestionNotFoundError,
     InterviewSessionNotFoundError,
     InvalidSessionStateError,
+    MediaReadinessRequiredError,
     NoApprovedCapabilitiesError,
     QuestionAlreadyAnsweredError,
+    complete_interview_session_atomic,
     create_interview_session,
     generate_next_question_for_session,
     get_interview_execution_state,
@@ -143,6 +147,11 @@ async def list_application_interviews_endpoint(
     return list((await session.scalars(stmt)).all())
 
 
+@router.post(
+    "/api/v1/interviews/{session_id}/start",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_200_OK,
+)
 @router.patch(
     "/api/v1/interviews/{session_id}/start",
     response_model=InterviewSessionResponse,
@@ -150,23 +159,36 @@ async def list_application_interviews_endpoint(
 )
 async def start_interview_session_endpoint(
     session_id: UUID,
-    current_user: User = Depends(require_interview_manager),
+    request: Request,
+    body: InterviewStartRequest | None = None,
+    current_user: User = Depends(require_interview_participant),
     session: AsyncSession = Depends(get_db_session),
 ):
     try:
+        duration_mins = body.duration_minutes if body else None
+        media_verified = body.media_verified if body else True
+        allow_reconnect = (request.method == "POST")
         return await start_interview_session(
             session=session,
             session_id=session_id,
             organization_id=current_user.organization_id,
+            duration_minutes=duration_mins,
+            media_verified=media_verified,
+            allow_reconnect=allow_reconnect,
         )
     except InterviewSessionNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
         ) from e
-    except CandidateNotShortlistedError as e:
+    except (CandidateNotShortlistedError, MediaReadinessRequiredError, ValueError) as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+    except InterviewExpiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
             detail=str(e),
         ) from e
     except InvalidSessionStateError as e:
@@ -279,6 +301,15 @@ async def submit_live_answer_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+class InterviewCompleteRequest(BaseModel):
+    reason: str | None = "ALL_ROUNDS_FINISHED"
+
+
+@router.post(
+    "/api/v1/interviews/{session_id}/complete",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_200_OK,
+)
 @router.patch(
     "/api/v1/interviews/{session_id}/complete",
     response_model=InterviewSessionResponse,
@@ -286,22 +317,23 @@ async def submit_live_answer_endpoint(
 )
 async def complete_interview_session_endpoint(
     session_id: UUID,
-    current_user: User = Depends(require_interview_manager),
+    body: InterviewCompleteRequest | None = None,
+    current_user: User = Depends(require_interview_participant),
     session: AsyncSession = Depends(get_db_session),
 ):
-    interview_session = await get_tenant_interview_session(
-        session, session_id, current_user.organization_id
-    )
-    if interview_session is None:
+    completion_reason = (body.reason if body and body.reason else "ALL_ROUNDS_FINISHED")
+    try:
+        return await complete_interview_session_atomic(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+            reason=completion_reason,
+        )
+    except InterviewSessionNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Interview session not found",
-        )
-    interview_session.status = "COMPLETED"
-    interview_session.ended_at = datetime.utcnow()
-    await session.commit()
-    await session.refresh(interview_session)
-    return interview_session
+        ) from e
 
 
 @router.get(
@@ -692,6 +724,39 @@ async def generate_interview_session_report_endpoint(
         ) from e
 
 
+@router.post(
+    "/api/v1/interviews/{session_id}/report/retry",
+    response_model=InterviewReport,
+    status_code=status.HTTP_200_OK,
+)
+async def retry_interview_session_report_endpoint(
+    session_id: UUID,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Retries report generation for an interview session without duplicating evidence, scorecards, or completed reports.
+    """
+    try:
+        report_obj = await generate_and_persist_interview_report(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+            generation_source="SYSTEM_AI_RETRY",
+        )
+        return await build_interview_report_response(session, report_obj)
+    except InterviewSessionNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except InvalidSessionStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
 @router.get(
     "/api/v1/interviews/{session_id}/report",
     response_model=InterviewReport,
@@ -699,7 +764,7 @@ async def generate_interview_session_report_endpoint(
 )
 async def get_interview_session_report_endpoint(
     session_id: UUID,
-    current_user: User = Depends(require_interview_manager),
+    current_user: User = Depends(require_interview_participant),
     session: AsyncSession = Depends(get_db_session),
 ):
     """
@@ -784,4 +849,150 @@ async def batch_start_interviews_endpoint(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/api/v1/interviews/{session_id}/start",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def start_interview_endpoint(
+    session_id: UUID,
+    payload: InterviewStartRequest | None = None,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Validates pre-interview media readiness and enforces HR-configured duration (5, 15, 30, 45, 60m).
+    Persists start time and authoritative deadline.
+    """
+    duration = payload.duration_minutes if payload else None
+    media_verified = payload.media_verified if payload else True
+
+    try:
+        sess = await start_interview_session(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+            duration_minutes=duration,
+            media_verified=media_verified,
+        )
+        return sess
+    except MediaReadinessRequiredError as e:
+        raise HTTPException(
+            status_code=status.HTTP_412_PRECONDITION_FAILED,
+            detail=str(e),
+        ) from e
+    except InterviewSessionNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except CandidateNotShortlistedError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        ) from e
+    except InvalidSessionStateError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/api/v1/interviews/{session_id}/complete",
+    response_model=InterviewSessionResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def complete_interview_endpoint(
+    session_id: UUID,
+    payload: dict | None = None,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Completes the interview atomically and idempotently.
+    Triggers post-interview scorecard and resilient report generation.
+    """
+    reason = (payload or {}).get("reason", "NORMAL")
+    sess = await get_tenant_interview_session(session, session_id, current_user.organization_id)
+    if not sess:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Interview session '{session_id}' not found.",
+        )
+
+    try:
+        completed_sess = await complete_interview_session_atomic(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+            reason=reason,
+        )
+        return completed_sess
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error finalizing interview: {e}",
+        ) from e
+
+
+@router.get(
+    "/api/v1/interviews/{session_id}/state",
+    status_code=status.HTTP_200_OK,
+)
+async def get_interview_state_endpoint(
+    session_id: UUID,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Returns authoritative session status, remaining seconds until deadline, and completion info.
+    """
+    try:
+        state = await get_interview_execution_state(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+        )
+        return state
+    except InterviewSessionNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+
+
+@router.post(
+    "/api/v1/interviews/{session_id}/report/retry",
+    response_model=InterviewReport,
+    status_code=status.HTTP_200_OK,
+)
+async def retry_interview_report_endpoint(
+    session_id: UUID,
+    current_user: User = Depends(require_interview_participant),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """
+    Safely retries AI report generation without duplicate scorecards or destroying raw evidence.
+    """
+    try:
+        report_obj = await generate_and_persist_interview_report(
+            session=session,
+            session_id=session_id,
+            organization_id=current_user.organization_id,
+            force_regenerate=True,
+        )
+        return await build_interview_report_response(session, report_obj)
+    except InterviewSessionNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Report generation retry failed: {e}",
         ) from e

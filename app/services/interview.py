@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -58,6 +58,18 @@ class NoApprovedCapabilitiesError(Exception):
 
 class CandidateNotShortlistedError(Exception):
     pass
+
+
+class InterviewExpiredError(Exception):
+    pass
+
+
+class MediaReadinessRequiredError(Exception):
+    pass
+
+
+ALLOWED_INTERVIEW_DURATIONS = {5, 15, 30, 45, 60}
+DEFAULT_INTERVIEW_DURATION = 30
 
 
 async def get_tenant_interview_session(
@@ -160,10 +172,28 @@ async def create_interview_session(
     return interview_session
 
 
-async def start_interview_session(
+def _is_expired(deadline: datetime | None) -> bool:
+    if deadline is None:
+        return False
+    now = datetime.now(timezone.utc)
+    dl = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+    return now >= dl
+
+
+def _get_remaining_seconds(deadline: datetime | None) -> int:
+    if deadline is None:
+        return 0
+    now = datetime.now(timezone.utc)
+    dl = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+    diff = (dl - now).total_seconds()
+    return max(0, int(diff))
+
+
+async def complete_interview_session_atomic(
     session: AsyncSession,
     session_id: UUID,
     organization_id: UUID,
+    reason: str = "ALL_ROUNDS_FINISHED",
 ) -> InterviewSession:
     interview_session = await get_tenant_interview_session(
         session, session_id, organization_id
@@ -171,12 +201,108 @@ async def start_interview_session(
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
 
+    if interview_session.status == "COMPLETED":
+        return interview_session
+
+    now = datetime.now(timezone.utc)
+    interview_session.status = "COMPLETED"
+    interview_session.ended_at = now
+    interview_session.completion_reason = reason
+    interview_session.updated_at = now
+
+    max_msg_seq_stmt = select(func.coalesce(func.max(InterviewMessage.sequence_number), 0)).where(
+        InterviewMessage.session_id == interview_session.id
+    )
+    current_max_seq = (await session.scalar(max_msg_seq_stmt)) or 0
+
+    end_content = (
+        "Interview time is over. Session concluded due to duration deadline."
+        if reason == "TIME_EXPIRED"
+        else (
+            "Interview interrupted due to unrecoverable camera/microphone loss."
+            if reason == "INTERRUPTED_MEDIA_FAILURE"
+            else f"Interview session completed. Reason: {reason}."
+        )
+    )
+    complete_msg = InterviewMessage(
+        session_id=interview_session.id,
+        role="SYSTEM",
+        content=end_content,
+        sequence_number=current_max_seq + 1,
+    )
+    session.add(complete_msg)
+    await session.commit()
+    await session.refresh(interview_session)
+
+    # 1. Trigger post-interview scorecard workflow exactly once
+    try:
+        from app.services.post_interview_scorecard import generate_post_interview_scorecard
+        await generate_post_interview_scorecard(
+            session=session,
+            application_id=interview_session.application_id,
+            organization_id=organization_id,
+            force_refresh=False,
+        )
+    except Exception as sc_err:
+        logger.error(f"Error generating post-interview scorecard for session {session_id}: {sc_err}", exc_info=True)
+
+    # 2. Trigger post-interview report generation
+    try:
+        from app.services.interview_report import generate_and_persist_interview_report
+        await generate_and_persist_interview_report(
+            session=session,
+            session_id=session_id,
+            organization_id=organization_id,
+            generation_source="SYSTEM_AI",
+        )
+    except Exception as rep_err:
+        logger.error(f"Error generating post-interview report for session {session_id}: {rep_err}", exc_info=True)
+
+    await session.refresh(interview_session)
+    return interview_session
+
+
+async def start_interview_session(
+    session: AsyncSession,
+    session_id: UUID,
+    organization_id: UUID,
+    duration_minutes: int | None = None,
+    media_verified: bool = True,
+    allow_reconnect: bool = True,
+) -> InterviewSession:
+    if not media_verified:
+        raise MediaReadinessRequiredError("Cannot start interview session without verified camera and microphone readiness.")
+
+    interview_session = await get_tenant_interview_session(
+        session, session_id, organization_id
+    )
+    if interview_session is None:
+        raise InterviewSessionNotFoundError("Interview session not found")
+
     if interview_session.status == "IN_PROGRESS":
+        if not allow_reconnect:
+            raise InvalidSessionStateError(f"Cannot start interview session with status '{interview_session.status}'")
+        if _is_expired(interview_session.deadline_at):
+            return await complete_interview_session_atomic(
+                session=session,
+                session_id=session_id,
+                organization_id=organization_id,
+                reason="TIME_EXPIRED",
+            )
+        return interview_session
+
+    if interview_session.status == "COMPLETED":
         return interview_session
 
     if interview_session.status not in ("CREATED", "SCHEDULED"):
         raise InvalidSessionStateError(
             f"Cannot start interview in status '{interview_session.status}'. Expected 'CREATED' or 'SCHEDULED'."
+        )
+
+    chosen_duration = duration_minutes or interview_session.duration_minutes or DEFAULT_INTERVIEW_DURATION
+    if chosen_duration not in ALLOWED_INTERVIEW_DURATIONS:
+        raise InvalidSessionStateError(
+            f"Invalid interview duration {chosen_duration}. Allowed durations are {sorted(list(ALLOWED_INTERVIEW_DURATIONS))} minutes."
         )
 
     # Server-side interview gating: Candidate must not be NOT_SHORTLISTED
@@ -189,16 +315,19 @@ async def start_interview_session(
     ):
         raise CandidateNotShortlistedError("Cannot start interview: Candidate is not shortlisted. Only shortlisted candidates may be interviewed.")
 
+    now = datetime.now(timezone.utc)
     interview_session.status = "IN_PROGRESS"
-    interview_session.started_at = datetime.utcnow()
-    interview_session.updated_at = datetime.utcnow()
+    interview_session.started_at = now
+    interview_session.duration_minutes = chosen_duration
+    interview_session.deadline_at = now + timedelta(minutes=chosen_duration)
+    interview_session.updated_at = now
 
     # Add initial system message if empty
     if not interview_session.messages:
         sys_msg = InterviewMessage(
             session_id=interview_session.id,
             role="SYSTEM",
-            content="Interview session started.",
+            content=f"Interview session started with duration of {chosen_duration} minutes.",
             sequence_number=1,
         )
         session.add(sys_msg)
@@ -359,6 +488,16 @@ async def generate_next_question_for_session(
     )
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
+
+    if interview_session.status == "COMPLETED" or _is_expired(interview_session.deadline_at):
+        if interview_session.status != "COMPLETED":
+            await complete_interview_session_atomic(
+                session=session,
+                session_id=session_id,
+                organization_id=organization_id,
+                reason="TIME_EXPIRED",
+            )
+        raise InterviewExpiredError("Interview duration has expired. Question generation stopped.")
 
     if interview_session.status != "IN_PROGRESS":
         raise InvalidSessionStateError(
@@ -568,6 +707,16 @@ async def submit_interview_answer(
     )
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
+
+    if interview_session.status == "COMPLETED" or _is_expired(interview_session.deadline_at):
+        if interview_session.status != "COMPLETED":
+            await complete_interview_session_atomic(
+                session=session,
+                session_id=session_id,
+                organization_id=organization_id,
+                reason="TIME_EXPIRED",
+            )
+        raise InterviewExpiredError("Interview duration has expired. No further answers accepted.")
 
     if interview_session.status != "IN_PROGRESS":
         raise InvalidSessionStateError(
@@ -874,6 +1023,14 @@ async def get_interview_execution_state(
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
 
+    if interview_session.status == "IN_PROGRESS" and _is_expired(interview_session.deadline_at):
+        interview_session = await complete_interview_session_atomic(
+            session=session,
+            session_id=session_id,
+            organization_id=organization_id,
+            reason="TIME_EXPIRED",
+        )
+
     # Load approved plan
     plan_stmt = (
         select(InterviewPlan)
@@ -909,9 +1066,20 @@ async def get_interview_execution_state(
         "round_id": str(active_round.id) if active_round else None,
     } if active_round else None
 
+    remaining_secs = _get_remaining_seconds(interview_session.deadline_at) if interview_session.status == "IN_PROGRESS" else 0
+    deadline_iso = None
+    if interview_session.deadline_at:
+        dl = interview_session.deadline_at if interview_session.deadline_at.tzinfo else interview_session.deadline_at.replace(tzinfo=timezone.utc)
+        deadline_iso = dl.isoformat()
+
     return {
         "session_id": str(interview_session.id),
         "interview_status": interview_session.status,
+        "duration_minutes": interview_session.duration_minutes,
+        "deadline_at": deadline_iso,
+        "remaining_seconds": remaining_secs,
+        "completion_reason": interview_session.completion_reason,
+        "report_status": interview_session.report_status,
         "current_round": current_round_dict,
         "current_question": latest_q_text,
         "current_question_type": latest_q_type,
@@ -935,6 +1103,16 @@ async def process_live_candidate_message(
     )
     if interview_session is None:
         raise InterviewSessionNotFoundError("Interview session not found")
+
+    if interview_session.status == "COMPLETED" or _is_expired(interview_session.deadline_at):
+        if interview_session.status != "COMPLETED":
+            await complete_interview_session_atomic(
+                session=session,
+                session_id=session_id,
+                organization_id=organization_id,
+                reason="TIME_EXPIRED",
+            )
+        raise InterviewExpiredError("Interview duration has expired. Message processing stopped.")
 
     if interview_session.status != "IN_PROGRESS":
         raise InvalidSessionStateError(

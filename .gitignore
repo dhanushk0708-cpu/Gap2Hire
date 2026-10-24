@@ -12,3 +12,10 @@ credentials/google-oauth.json
 
 echo scratch/>>.gitignore
 echo scratch_*.py>>.gitignore
+
+# Runtime uploads and interview evidence
+/uploads/resumes/
+/storage/integrity/
+
+# Local model weights
+/yolov8n.pt

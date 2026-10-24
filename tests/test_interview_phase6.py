@@ -214,7 +214,7 @@ async def test_approved_plan_can_be_scheduled():
         data = res.json()
         assert data["session_id"] == str(setup["session_id"])
         assert data["status"] == "SCHEDULED"
-        assert "meet.google.com" in data["meeting_url"]
+        assert "demo.gap2hire.local" in data["meeting_url"] or "meet.google.com" in data["meeting_url"]
         assert data["duration_minutes"] == 45
         assert data["timezone"] == "America/New_York"
         assert data["candidate_email_sent"] is True

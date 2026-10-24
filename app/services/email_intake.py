@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -94,7 +95,7 @@ async def process_email_intake(
     existing_imported = await session.scalar(ext_stmt)
 
     # If already successfully processed into an Application, mark as DUPLICATE_RESUME
-    if existing_imported and existing_imported.status == "PROCESSED" and existing_imported.application_id is not None:
+    if existing_imported and existing_imported.status in ("PROCESSED", "SKIPPED"):
         primary_att, _ = find_primary_resume(email.attachments)
         classification = EmailClassificationEnum(existing_imported.classification) if existing_imported.classification in EmailClassificationEnum.__members__ else EmailClassificationEnum.CANDIDATE_APPLICATION
         return EmailIntakeResult(
@@ -106,13 +107,13 @@ async def process_email_intake(
             candidate_id=existing_imported.candidate_id,
             is_existing_candidate=existing_imported.candidate_id is not None,
             application_id=existing_imported.application_id,
-            is_existing_application=True,
+            is_existing_application=existing_imported.application_id is not None,
             job_id=existing_imported.job_id,
             primary_attachment=primary_att,
             attachment_count=len(email.attachments),
             should_process_resume=False,
             intake_status="SKIPPED",
-            reason="DUPLICATE_RESUME: Candidate application already exists for this email.",
+            reason="DUPLICATE_RESUME: Candidate application already processed for this email.",
         )
 
     # Create or update ImportedEmail tracking record
@@ -379,34 +380,74 @@ async def batch_sync_emails(
             EmailConnection.organization_id == organization_id,
         )
         conn = await session.scalar(stmt)
+        if not conn:
+            from app.services.email_connection import EmailConnectionNotFoundError
+            raise EmailConnectionNotFoundError("Email connection not found or inaccessible")
     else:
-        # Fallback to active organization connection
+        # Check connections for this organization
         stmt = (
             select(EmailConnection)
-            .where(
-                EmailConnection.organization_id == organization_id,
-                EmailConnection.status == "ACTIVE",
+            .where(EmailConnection.organization_id == organization_id)
+            .order_by(
+                (EmailConnection.status == "ACTIVE").desc(),
+                EmailConnection.created_at.desc(),
             )
-            .order_by(EmailConnection.created_at.desc())
         )
         conn = await session.scalar(stmt)
 
     # Instantiate provider
     if conn and conn.provider.upper() == "GMAIL":
+        from app.core.security import decrypt_auth_payload, encrypt_auth_payload
         from app.services.gmail_provider import GmailProvider
 
-        auth_data = {}
-        if conn.auth_payload_encrypted:
-            try:
-                auth_data = json.loads(conn.auth_payload_encrypted)
-            except Exception:
-                pass
+        if conn.status != "ACTIVE":
+            raise ValueError(
+                f"Gmail connection '{conn.account_email}' is {conn.status}. "
+                "OAuth authentication must be completed before mailbox synchronization."
+            )
+
+        if not conn.auth_payload_encrypted:
+            raise ValueError(
+                f"Gmail connection '{conn.account_email}' has no credentials. "
+                "Please authenticate via Google OAuth."
+            )
+
+        try:
+            auth_data = decrypt_auth_payload(conn.auth_payload_encrypted)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to decrypt credentials for '{conn.account_email}'. Please re-authenticate."
+            ) from exc
+
+        access_token = auth_data.get("access_token", "")
+        refresh_token = auth_data.get("refresh_token", "")
+        expires_in = auth_data.get("expires_in")
+
+        if not access_token and not refresh_token:
+            raise ValueError(
+                f"Gmail connection '{conn.account_email}' has no valid access or refresh tokens. "
+                "Please reconnect via Google OAuth."
+            )
+
+        async def _on_token_refreshed(new_tokens: dict[str, Any]):
+            updated_payload = {**auth_data, **new_tokens}
+            conn.auth_payload_encrypted = encrypt_auth_payload(updated_payload)
+            conn.updated_at = datetime.utcnow()
+            await session.commit()
+
         provider = GmailProvider(
-            access_token=auth_data.get("access_token", ""),
+            access_token=access_token,
+            refresh_token=refresh_token,
             account_email=conn.account_email,
+            expires_in=expires_in,
+            on_token_refreshed=_on_token_refreshed,
         )
+    elif conn and conn.provider.upper() == "FAKE":
+        provider = FakeEmailProvider(account_email=conn.account_email)
+    elif conn:
+        raise ValueError(f"Unsupported email provider: {conn.provider}")
     else:
-        account_email = conn.account_email if conn else f"jobs@{org.slug or 'gap2hire'}.com"
+        account_email = f"jobs@{org.slug or 'gap2hire'}.com"
         provider = FakeEmailProvider(account_email=account_email)
 
     # Fetch bounded batch of emails
@@ -429,7 +470,7 @@ async def batch_sync_emails(
             )
             response.details.append(intake_res)
 
-            if intake_res.intake_status == "SKIPPED":
+            if intake_res.intake_status == "SKIPPED" and "duplicate" in intake_res.reason.lower():
                 response.duplicates_skipped += 1
             elif intake_res.classification == EmailClassificationEnum.CANDIDATE_APPLICATION:
                 response.candidate_emails += 1

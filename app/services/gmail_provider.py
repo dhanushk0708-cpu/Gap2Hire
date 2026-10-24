@@ -99,8 +99,23 @@ def clean_html_to_text(html_content: str) -> str:
     return text.strip()
 
 
+class GmailAuthenticationError(Exception):
+    """Raised when Gmail OAuth tokens are missing, expired, revoked, or refresh fails."""
+    pass
+
+
+class GmailSyncError(Exception):
+    """Raised when Gmail API requests fail during mailbox synchronization."""
+    pass
+
+
 def get_google_redirect_uri(cfg: dict[str, Any] | None = None) -> str:
     """Returns the canonical Google OAuth redirect URI."""
+    from app.core.config import settings
+
+    if getattr(settings, "google_redirect_uri", None):
+        return settings.google_redirect_uri
+
     if os.getenv("GOOGLE_REDIRECT_URI"):
         return os.getenv("GOOGLE_REDIRECT_URI", DEFAULT_REDIRECT_URI)
 
@@ -136,6 +151,11 @@ def get_google_auth_url(state: str = "") -> str:
     """Constructs the Google OAuth authorization consent URL."""
     cfg = load_google_oauth_config()
     client_id = cfg.get("client_id", "")
+    if not client_id:
+        raise ValueError(
+            "Google OAuth client_id is not configured. Set GOOGLE_CLIENT_ID in your environment or provide credentials/google-oauth.json."
+        )
+
     redirect_uri = get_google_redirect_uri(cfg)
     scope = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/userinfo.email"
 
@@ -152,22 +172,33 @@ def get_google_auth_url(state: str = "") -> str:
 
 
 async def exchange_google_code_for_tokens(code: str) -> dict[str, Any]:
-    """Exchanges an authorization code for Google access and refresh tokens."""
+    """Exchanges an authorization code for Google access and refresh tokens without logging secrets."""
     cfg = load_google_oauth_config()
     token_uri = cfg.get("token_uri", "https://oauth2.googleapis.com/token")
     redirect_uri = get_google_redirect_uri(cfg)
 
+    client_id = cfg.get("client_id")
+    client_secret = cfg.get("client_secret")
+    if not client_id or not client_secret:
+        raise ValueError(
+            "Google OAuth client credentials missing. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."
+        )
+
     data = {
         "code": code,
-        "client_id": cfg.get("client_id"),
-        "client_secret": cfg.get("client_secret"),
+        "client_id": client_id,
+        "client_secret": client_secret,
         "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(token_uri, data=data)
-        resp.raise_for_status()
+        if not resp.is_success:
+            logger.error(f"Google OAuth token exchange failed with HTTP {resp.status_code}")
+            raise GmailAuthenticationError(
+                f"Google OAuth token exchange failed (HTTP {resp.status_code}). Please verify credentials."
+            )
         token_data = resp.json()
 
         # Fetch account email from userinfo
@@ -183,27 +214,66 @@ async def exchange_google_code_for_tokens(code: str) -> dict[str, Any]:
                     userinfo = userinfo_resp.json()
                     account_email = userinfo.get("email", account_email)
             except Exception as e:
-                logger.warning(f"Error fetching userinfo from Google: {e}")
+                logger.warning(f"Notice: Failed to fetch userinfo from Google: {e}")
 
         token_data["account_email"] = account_email
         return token_data
 
 
+async def refresh_google_access_token(refresh_token: str) -> dict[str, Any]:
+    """Refreshes an expired Google access token using the stored refresh token."""
+    cfg = load_google_oauth_config()
+    token_uri = cfg.get("token_uri", "https://oauth2.googleapis.com/token")
+    client_id = cfg.get("client_id")
+    client_secret = cfg.get("client_secret")
+
+    if not client_id or not client_secret:
+        raise GmailAuthenticationError("Google OAuth client credentials missing for token refresh.")
+
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(token_uri, data=data)
+        if not resp.is_success:
+            logger.warning(f"Google token refresh failed with HTTP {resp.status_code}")
+            raise GmailAuthenticationError("Failed to refresh expired Google OAuth token. Reconnection required.")
+        return resp.json()
+
+
 class GmailProvider(EmailProvider):
     """Production-grade Gmail Provider communicating directly with the Google Gmail REST API."""
 
-    def __init__(self, access_token: str = "", account_email: str = ""):
+    def __init__(
+        self,
+        access_token: str = "",
+        refresh_token: str = "",
+        account_email: str = "",
+        expires_in: int | None = None,
+        on_token_refreshed: Any = None,
+    ):
+        import time
+
         self.access_token = access_token
+        self.refresh_token = refresh_token
         self.account_email = account_email
+        self.expires_at = (time.time() + expires_in) if expires_in else 0.0
+        self.on_token_refreshed = on_token_refreshed
         self.base_url = "https://gmail.googleapis.com/gmail/v1/users/me"
 
     async def connect(self, connection_data: dict[str, Any]) -> bool:
         self.access_token = connection_data.get("access_token", self.access_token)
+        self.refresh_token = connection_data.get("refresh_token", self.refresh_token)
         self.account_email = connection_data.get("account_email", self.account_email)
-        return bool(self.access_token)
+        return bool(self.access_token or self.refresh_token)
 
     async def disconnect(self) -> bool:
         self.access_token = ""
+        self.refresh_token = ""
         return True
 
     def _get_headers(self) -> dict[str, str]:
@@ -212,13 +282,43 @@ class GmailProvider(EmailProvider):
             "Accept": "application/json",
         }
 
+    async def refresh_token_if_needed(self) -> None:
+        """Refreshes access token if expired or missing, invoking notification callback."""
+        import time
+
+        now = time.time()
+        needs_refresh = (not self.access_token) or (self.expires_at > 0 and now >= self.expires_at - 60)
+        if needs_refresh and self.refresh_token:
+            try:
+                new_data = await refresh_google_access_token(self.refresh_token)
+                self.access_token = new_data.get("access_token", self.access_token)
+                expires_in = new_data.get("expires_in", 3600)
+                self.expires_at = time.time() + expires_in
+                if self.on_token_refreshed:
+                    try:
+                        res = self.on_token_refreshed(new_data)
+                        if hasattr(res, "__await__"):
+                            await res
+                    except Exception as cb_err:
+                        logger.warning(f"on_token_refreshed callback encountered notice: {cb_err}")
+            except Exception as exc:
+                if not self.access_token:
+                    raise GmailAuthenticationError(f"Token refresh failed and no access token available: {exc}") from exc
+                logger.warning(f"Token refresh attempt notice: {exc}")
+
+    def _verify_credentials(self) -> None:
+        if not self.access_token and not self.refresh_token:
+            raise GmailAuthenticationError(
+                f"Gmail connection '{self.account_email}' has no valid authorization credentials. Please connect via OAuth."
+            )
+
     async def fetch_emails(
         self,
         limit: int = 50,
         query: str | None = None,
     ) -> list[NormalizedEmail]:
-        if not self.access_token:
-            return []
+        self._verify_credentials()
+        await self.refresh_token_if_needed()
 
         params: dict[str, Any] = {"maxResults": min(limit, 100)}
         if query:
@@ -230,9 +330,26 @@ class GmailProvider(EmailProvider):
                 headers=self._get_headers(),
                 params=params,
             )
-            if not resp.is_success:
-                logger.warning(f"Gmail API list messages failed: {resp.status_code} {resp.text}")
-                return []
+
+            # Retry on 401 if refresh token is available
+            if resp.status_code == 401 and self.refresh_token:
+                await self.refresh_token_if_needed()
+                resp = await client.get(
+                    f"{self.base_url}/messages",
+                    headers=self._get_headers(),
+                    params=params,
+                )
+
+            if resp.status_code == 401:
+                raise GmailAuthenticationError(
+                    f"Gmail authorization expired or revoked for '{self.account_email}'. Please re-authenticate."
+                )
+            elif resp.status_code == 403:
+                raise GmailAuthenticationError(
+                    f"Gmail API access forbidden for '{self.account_email}'. Ensure Gmail API is enabled."
+                )
+            elif not resp.is_success:
+                raise GmailSyncError(f"Gmail API list messages failed: HTTP {resp.status_code}")
 
             data = resp.json()
             messages_meta = data.get("messages", [])
@@ -248,14 +365,21 @@ class GmailProvider(EmailProvider):
             return emails
 
     async def get_email(self, external_id: str) -> NormalizedEmail | None:
-        if not self.access_token:
+        if not self.access_token and not self.refresh_token:
             return None
+        await self.refresh_token_if_needed()
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 f"{self.base_url}/messages/{external_id}?format=full",
                 headers=self._get_headers(),
             )
+            if resp.status_code == 401 and self.refresh_token:
+                await self.refresh_token_if_needed()
+                resp = await client.get(
+                    f"{self.base_url}/messages/{external_id}?format=full",
+                    headers=self._get_headers(),
+                )
             if not resp.is_success:
                 logger.warning(f"Gmail API get message {external_id} failed: {resp.status_code}")
                 return None
@@ -372,14 +496,21 @@ class GmailProvider(EmailProvider):
         external_id: str,
         attachment_id: str,
     ) -> bytes | None:
-        if not self.access_token:
+        if not self.access_token and not self.refresh_token:
             return None
+        await self.refresh_token_if_needed()
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
                 f"{self.base_url}/messages/{external_id}/attachments/{attachment_id}",
                 headers=self._get_headers(),
             )
+            if resp.status_code == 401 and self.refresh_token:
+                await self.refresh_token_if_needed()
+                resp = await client.get(
+                    f"{self.base_url}/messages/{external_id}/attachments/{attachment_id}",
+                    headers=self._get_headers(),
+                )
             if not resp.is_success:
                 return None
 

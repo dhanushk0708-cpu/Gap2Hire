@@ -307,7 +307,9 @@ def test_fastapi_callback_route_exists():
 
     paths = list(app.openapi()["paths"].keys())
     expected_callback_path = "/api/v1/email-connections/oauth/callback"
+    alias_callback_path = "/api/v1/email/oauth/callback"
     assert expected_callback_path in paths, f"Expected route {expected_callback_path} not found in FastAPI OpenAPI schema paths: {paths}"
+    assert alias_callback_path in paths, f"Expected route {alias_callback_path} not found in FastAPI OpenAPI schema paths: {paths}"
 
 
 # 12. Gmail message parsing with RFC 2047 MIME headers and UTF-8 text
@@ -438,3 +440,194 @@ def test_batch_sync_response_json_serialization_with_binary_data():
     # Ensure binary content was not serialized into JSON
     assert "content" not in parsed["details"][0]["primary_attachment"]
 
+
+# 17. OAuth state generation and CSRF protection validation
+def test_oauth_state_generation_and_validation():
+    from app.core.security import generate_oauth_state, validate_oauth_state
+
+    org_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+
+    state = generate_oauth_state(organization_id=org_id, user_id=user_id)
+    assert state is not None
+    assert isinstance(state, str)
+
+    payload = validate_oauth_state(state)
+    assert payload["org_id"] == str(org_id)
+    assert payload["user_id"] == str(user_id)
+    assert "nonce" in payload
+    assert payload["exp"] > 0
+
+    # Validation rejects empty or missing state
+    with pytest.raises(ValueError) as exc1:
+        validate_oauth_state("")
+    assert "Missing OAuth state" in str(exc1.value)
+
+    # Validation rejects tampered state
+    with pytest.raises(ValueError) as exc2:
+        validate_oauth_state(state + "tampered")
+    assert "Invalid OAuth state" in str(exc2.value)
+
+
+# 18. Token encryption and decryption (Fernet AES)
+def test_auth_payload_encryption_and_decryption():
+    from app.core.security import decrypt_auth_payload, encrypt_auth_payload
+
+    tokens = {
+        "access_token": "ya29.sample_secret_access_token_12345",
+        "refresh_token": "1//sample_secret_refresh_token_67890",
+        "expires_in": 3600,
+    }
+
+    encrypted = encrypt_auth_payload(tokens)
+    assert encrypted is not None
+    # Must NOT be plain JSON
+    assert not encrypted.startswith("{")
+    assert "sample_secret_access_token_12345" not in encrypted
+    assert "sample_secret_refresh_token_67890" not in encrypted
+
+    # Decrypt restores original tokens
+    decrypted = decrypt_auth_payload(encrypted)
+    assert decrypted["access_token"] == tokens["access_token"]
+    assert decrypted["refresh_token"] == tokens["refresh_token"]
+    assert decrypted["expires_in"] == tokens["expires_in"]
+
+    # Legacy unencrypted JSON string is handled transparently
+    legacy_json = '{"access_token": "legacy_tok", "refresh_token": "legacy_ref"}'
+    decrypted_legacy = decrypt_auth_payload(legacy_json)
+    assert decrypted_legacy["access_token"] == "legacy_tok"
+
+    # Corrupt payload raises ValueError
+    with pytest.raises(ValueError):
+        decrypt_auth_payload("invalid_encrypted_data_string")
+
+
+# 19. Gmail connection cannot appear ACTIVE before successful OAuth completion
+@pytest.mark.asyncio
+async def test_gmail_connection_cannot_be_active_before_oauth_succeeds():
+    org_id = uuid.uuid4()
+    async with async_session_factory() as session:
+        org = Organization(id=org_id, name="OAuth Test Org", slug=f"oauth-{uuid.uuid4().hex[:6]}")
+        session.add(org)
+        await session.flush()
+
+        # Attempt to create a Gmail connection with status="ACTIVE" but no auth payload
+        create_req = EmailConnectionCreate(
+            provider="GMAIL",
+            account_email="unauthenticated@company.com",
+            status="ACTIVE",
+            auth_payload_encrypted=None,
+        )
+
+        conn = await create_email_connection(
+            session=session,
+            organization_id=org_id,
+            data=create_req,
+        )
+
+        # Enforced rule: Gmail connection without auth payload MUST be PENDING
+        assert conn.status == "PENDING"
+        assert conn.provider == "GMAIL"
+
+
+# 20. Invalid Gmail connection raises clear error and does NOT fall back to synthetic data
+@pytest.mark.asyncio
+async def test_batch_sync_rejects_pending_or_invalid_gmail_without_synthetic_fallback():
+    from app.services.email_intake import batch_sync_emails
+
+    org_id = uuid.uuid4()
+    async with async_session_factory() as session:
+        org = Organization(id=org_id, name="Invalid Gmail Org", slug=f"gmail-{uuid.uuid4().hex[:6]}")
+        session.add(org)
+        await session.flush()
+
+        # Create a PENDING Gmail connection
+        pending_conn = await create_email_connection(
+            session=session,
+            organization_id=org_id,
+            data=EmailConnectionCreate(
+                provider="GMAIL",
+                account_email="pending-sync@company.com",
+                status="PENDING",
+            ),
+        )
+
+        # Attempt batch sync: MUST raise ValueError with clear message, NOT return synthetic test emails
+        with pytest.raises(ValueError) as exc_info:
+            await batch_sync_emails(
+                session=session,
+                organization_id=org_id,
+                connection_id=pending_conn.id,
+            )
+
+        assert "OAuth authentication must be completed" in str(exc_info.value)
+        assert "pending-sync@company.com" in str(exc_info.value)
+
+
+# 21. OAuth callback rejects missing/invalid state and prevents arbitrary organization association
+@pytest.mark.asyncio
+async def test_oauth_callback_enforces_csrf_and_tenant_isolation():
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        # Call with no state parameter -> 400 Bad Request
+        resp_no_state = await client.get("/api/v1/email-connections/oauth/callback?code=mock_code")
+        assert resp_no_state.status_code == 400
+        assert "CSRF" in resp_no_state.json()["detail"] or "state" in resp_no_state.json()["detail"].lower()
+
+        # Call with invalid/tampered state parameter -> 400 Bad Request
+        resp_bad_state = await client.get("/api/v1/email-connections/oauth/callback?code=mock_code&state=bad_tampered_state")
+        assert resp_bad_state.status_code == 400
+
+
+# 22. Token refresh flow updates credentials via callback
+@pytest.mark.asyncio
+async def test_gmail_token_refresh_flow():
+    from unittest.mock import AsyncMock, patch
+    from app.services.gmail_provider import GmailProvider
+
+    callback_called = False
+    refreshed_data = None
+
+    async def mock_callback(new_tokens):
+        nonlocal callback_called, refreshed_data
+        callback_called = True
+        refreshed_data = new_tokens
+
+    mock_refresh_response = {
+        "access_token": "ya29.new_refreshed_access_token",
+        "expires_in": 3600,
+        "token_type": "Bearer",
+    }
+
+    with patch("app.services.gmail_provider.refresh_google_access_token", new=AsyncMock(return_value=mock_refresh_response)):
+        provider = GmailProvider(
+            access_token="",
+            refresh_token="valid_refresh_token_xyz",
+            account_email="refresh.test@example.com",
+            on_token_refreshed=mock_callback,
+        )
+
+        await provider.refresh_token_if_needed()
+
+        assert provider.access_token == "ya29.new_refreshed_access_token"
+        assert callback_called is True
+        assert refreshed_data["access_token"] == "ya29.new_refreshed_access_token"
+
+
+# 23. OAuth callback alias /api/v1/email/oauth/callback and browser HTML response
+@pytest.mark.asyncio
+async def test_oauth_callback_alias_and_browser_html_response():
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        # Call alias route with invalid state from browser
+        resp = await client.get(
+            "/api/v1/email/oauth/callback?code=mock_code&state=invalid",
+            headers={"accept": "text/html,application/xhtml+xml"},
+        )
+        assert resp.status_code == 400
+        assert "text/html" in resp.headers["content-type"]
+        assert "OAuth Authorization Failed" in resp.text

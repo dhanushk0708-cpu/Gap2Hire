@@ -10,7 +10,9 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.application import Application
     from app.models.interview import InterviewSession
+    from app.models.interview_plan import InterviewPlan, InterviewPlanRound
     from app.models.organization import Organization
+    from app.models.simulated_notification import SimulatedNotification
     from app.models.user import User
 
 
@@ -68,13 +70,13 @@ class InterviewSchedule(Base):
         nullable=True,
     )
 
-    meeting_url: Mapped[str] = mapped_column(
+    meeting_url: Mapped[str | None] = mapped_column(
         String(500),
-        nullable=False,
+        nullable=True,
     )
 
     status: Mapped[str] = mapped_column(
-        String(50),
+        String(50),  # SCHEDULED, CONFIRMED, COMPLETED, CANCELLED
         nullable=False,
         default="SCHEDULED",
         index=True,
@@ -94,6 +96,53 @@ class InterviewSchedule(Base):
     invitation_notes: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
+    )
+
+    interviewer_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    interview_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="ONLINE",
+    )
+
+    interview_reference: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        unique=True,
+        index=True,
+    )
+
+    location: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
+    cancellation_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    booking_token: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+    plan_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("interview_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    round_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("interview_plan_rounds.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     created_by: Mapped[UUID | None] = mapped_column(
@@ -117,4 +166,12 @@ class InterviewSchedule(Base):
     session: Mapped["InterviewSession"] = relationship()
     application: Mapped["Application"] = relationship()
     organization: Mapped["Organization"] = relationship()
-    creator: Mapped["User | None"] = relationship()
+    plan: Mapped["InterviewPlan | None"] = relationship(foreign_keys=[plan_id])
+    round: Mapped["InterviewPlanRound | None"] = relationship(foreign_keys=[round_id])
+    creator: Mapped["User | None"] = relationship(foreign_keys=[created_by])
+    interviewer: Mapped["User | None"] = relationship(foreign_keys=[interviewer_id])
+    notifications: Mapped[list["SimulatedNotification"]] = relationship(
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+        order_by="SimulatedNotification.created_at.desc()",
+    )
